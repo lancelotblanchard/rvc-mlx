@@ -1,0 +1,8 @@
+.venv
+htmlcov
+rvc_mlx.egg-info
+.coverage
+__pycache__
+
+.DS_Store
+.idea

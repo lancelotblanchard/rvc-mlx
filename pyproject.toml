@@ -1,0 +1,163 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rvc-mlx"
+version = "0.1.0"
+description = "My WIP implementation of RVC in MLX"
+readme = "README.md"
+authors = [
+    {name = "Lancelot Blanchard", email = "lancelot@media.mit.edu"}
+]
+maintainers = [
+    {name = "Lancelot Blanchard", email = "lancelot@media.mit.edu"}
+]
+license = {text = "MIT"}
+keywords = ["mlx", "pytorch", "machine-learning", "neural-networks", "deep-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: MacOS :: MacOS X",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "mlx==0.30.1",
+    "numpy==2.3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "torch==2.4.1",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "torch==2.4.1",
+]
+torch = [
+    "torch==2.4.1",
+]
+all = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "torch==2.4.1",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lancelotblanchard/rvc-mlx"
+Documentation = "https://github.com/lancelotblanchard/rvc-mlx#readme"
+Repository = "https://github.com/lancelotblanchard/rvc-mlx"
+"Bug Reports" = "https://github.com/lancelotblanchard/rvc-mlx/issues"
+Changelog = "https://github.com/lancelotblanchard/rvc-mlx/releases"
+
+[tool.setuptools]
+packages = ["rvc_mlx"]
+
+[tool.setuptools.package-data]
+rvc_mlx = ["py.typed"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--color=yes",
+    "-ra",
+    "--durations=10",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "fast: marks tests as fast",
+    "numerical: tests involving numerical computations",
+    "shape: tests for shape compatibility",
+    "dtype: tests for data type compatibility",
+    "error_handling: tests for error cases",
+    "edge_case: tests for edge cases",
+    "unit: unit tests",
+    "integration: integration tests",
+]
+filterwarnings = [
+    "error",
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["mlx.*", "torch.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["rvc_mlx"]
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+    "*/setup.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
