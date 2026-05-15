@@ -77,7 +77,7 @@ def stft(
         return ValueError(f"Expected hop_length > 0, but got hop_length={hop_length}")
     if win_length <= 0 or win_length > n_fft:
         return ValueError(f"expected 0 < win_length <= n_fft, but got win_length={win_length}")
-    if window and (window.ndim != 1 or window.shape[0] != win_length):
+    if window is not None and (window.ndim != 1 or window.shape[0] != win_length):
         return ValueError(
             f"Expected a 1D window tensor of size equal to win_length={win_length}, but got window with"
             f"size {window.shape}"
@@ -86,7 +86,7 @@ def stft(
     window_ = window
     if win_length < n_fft:
         left = (n_fft - win_length) // 2
-        if window:
+        if window is not None:
             window_ = mx.zeros((n_fft,))
             window_ = mx.slice_update(window_, window, start_indices=mx.array([left]), axes=(0,))
         else:
@@ -95,7 +95,7 @@ def stft(
 
     n_frames = 1 + (length - n_fft) // hop_length
     x = mx.as_strided(x, (batch, n_frames, n_fft), (length, hop_length, 1))
-    if window_:
+    if window_ is not None:
         x = x * window_
 
     out: mx.array = mx.fft.fft(x)  # type: ignore[attr-defined]

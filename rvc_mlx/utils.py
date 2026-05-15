@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 import mlx.core as mx
 
 
@@ -111,3 +111,19 @@ def pad_constant(
     out = mx.slice_update(out, new_input, start_indices=mx.array(start_indices), axes=axes)
 
     return out
+
+
+def sequence_mask(length: mx.array, max_length: Optional[int] = None) -> mx.array:
+    """
+    Construct a boolean mask of shape (B, max_length) from a (B,) tensor of lengths. The element at index (i, j) is True
+    iff j < length[i]. Matches the `sequence_mask` helper used throughout the RVC reference implementation.
+
+    :param length: a 1D `mx.array` of integer lengths.
+    :param max_length: the length of the second dimension of the output mask. If None, the maximum value of `length` is
+    used.
+    :return: a boolean mask of shape (B, max_length).
+    """
+    if max_length is None:
+        max_length = int(length.max().item())
+    x = mx.arange(max_length, dtype=length.dtype)
+    return mx.expand_dims(x, 0) < mx.expand_dims(length, 1)

@@ -10,7 +10,7 @@ from functools import partial
 
 import pytest
 import numpy as np
-from rvc_mlx.utils import narrow, pad_constant
+from rvc_mlx.utils import narrow, pad_constant, sequence_mask
 import torch
 
 from .mlx_torch_comparison_framework import (
@@ -372,6 +372,56 @@ class TestUtilsPadConstant(BaseOperationTest):
             },
             description="Padding with integer input"
         )
+
+def _torch_sequence_mask(length, max_length=None):
+    """Reference implementation matching the helper used in RVC."""
+    if max_length is None:
+        max_length = length.max()
+    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+    return x.unsqueeze(0) < length.unsqueeze(1)
+
+
+class TestUtilsSequenceMask(BaseOperationTest):
+    @classmethod
+    def setup_class(cls):
+        cls.suite = OperationTestSuite(sequence_mask, _torch_sequence_mask, "sequence_mask")
+
+        cls.suite.add_test_case(
+            name="sequence_mask_implicit_max",
+            inputs={"length": np.array([1, 3, 2], dtype=np.int32)},
+            description="Sequence mask with max_length inferred from input",
+        )
+
+        cls.suite.add_test_case(
+            name="sequence_mask_explicit_max",
+            inputs={"length": np.array([2, 4, 1], dtype=np.int32), "max_length": 5},
+            description="Sequence mask with explicit max_length greater than max(length)",
+        )
+
+        cls.suite.add_test_case(
+            name="sequence_mask_max_equals_length",
+            inputs={"length": np.array([3, 3, 3], dtype=np.int32), "max_length": 3},
+            description="Sequence mask with max_length equal to all lengths (all True)",
+        )
+
+        cls.suite.add_test_case(
+            name="sequence_mask_zero_length",
+            inputs={"length": np.array([0, 2, 0], dtype=np.int32), "max_length": 3},
+            description="Sequence mask with zero-length entries (rows of all False)",
+        )
+
+        cls.suite.add_test_case(
+            name="sequence_mask_single_batch",
+            inputs={"length": np.array([5], dtype=np.int32), "max_length": 7},
+            description="Sequence mask with a single element in the batch",
+        )
+
+        cls.suite.add_test_case(
+            name="sequence_mask_large",
+            inputs={"length": np.array([100, 50, 75, 128], dtype=np.int64), "max_length": 128},
+            description="Sequence mask with larger lengths and int64 dtype",
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
