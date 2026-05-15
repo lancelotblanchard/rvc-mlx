@@ -2,6 +2,7 @@ from typing import Optional
 
 import librosa
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from rvc_mlx.stft import stft
@@ -97,3 +98,72 @@ class MelSpectrogram:
             mel_output = mel_output.astype(mx.float16)
         log_mel_spec = mx.log(mx.clip(mel_output, a_min=self.clamp, a_max=None))
         return log_mel_spec
+
+
+class ConvBlockRes(nn.Module):
+    """
+    Residual convolutional block used throughout RVC's RMVPE U-Net. Two 3x3 conv + BN + ReLU stages followed by an
+    additive shortcut. If `in_channels != out_channels`, the shortcut is a 1x1 conv that matches dimensions; otherwise
+    it is the identity.
+
+    Note: MLX uses channels-last convention for 2D convolutions. Callers should provide input in shape
+    `(B, H, W, C)` rather than PyTorch's `(B, C, H, W)`. The internal structure mirrors the PyTorch reference so weights
+    can be copied with a simple per-attribute transposition (see tests).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, momentum: float = 0.01):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+            ),
+            nn.BatchNorm(out_channels, momentum=momentum),
+            nn.ReLU(),
+            nn.Conv2d(
+                out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
+            ),
+            nn.BatchNorm(out_channels, momentum=momentum),
+            nn.ReLU(),
+        )
+        self._has_shortcut = in_channels != out_channels
+        if self._has_shortcut:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        residual = self.shortcut(x) if self._has_shortcut else x
+        return self.conv(x) + residual
+
+
+class ResEncoderBlock(nn.Module):
+    """
+    A stack of `n_blocks` `ConvBlockRes` modules followed by an optional `AvgPool2d`. When `kernel_size` is `None`, no
+    pooling is applied and the block returns a single tensor (used by `Intermediate`). Otherwise it returns a
+    `(skip, pooled)` tuple, where `skip` is the pre-pool feature map kept for the decoder and `pooled` is the
+    downsampled output that continues through the encoder.
+
+    Input/output are channels-last `(B, H, W, C)` in MLX convention.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Optional[tuple],
+        n_blocks: int = 1,
+        momentum: float = 0.01,
+    ):
+        super().__init__()
+        self.n_blocks = n_blocks
+        self.conv = [ConvBlockRes(in_channels, out_channels, momentum)]
+        for _ in range(n_blocks - 1):
+            self.conv.append(ConvBlockRes(out_channels, out_channels, momentum))
+        self.kernel_size = kernel_size
+        if self.kernel_size is not None:
+            self.pool = nn.AvgPool2d(kernel_size=kernel_size)
+
+    def __call__(self, x: mx.array):
+        for block in self.conv:
+            x = block(x)
+        if self.kernel_size is not None:
+            return x, self.pool(x)
+        return x
