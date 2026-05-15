@@ -86,16 +86,9 @@ class TestUtilsNarrow(BaseOperationTest):
             description="Should error when length is out of bounds"
         )
 
-
-from functools import partial
-
-
 class TestUtilsPadConstant(BaseOperationTest):
     @classmethod
     def setup_class(cls):
-        from rvc_mlx.utils import pad_constant
-
-        # Pre-fill mode='constant' for torch's pad
         torch_pad_constant = partial(torch.nn.functional.pad, mode='constant')
 
         cls.suite = OperationTestSuite(pad_constant, torch_pad_constant, "pad_constant")
@@ -299,6 +292,15 @@ class TestUtilsPadConstant(BaseOperationTest):
                 'value': -100.0
             },
             description="Padding with negative constant value"
+        )
+
+        cls.suite.add_test_case(
+            name="pad_with_different_type_value",
+            inputs={
+                'input': np.array([1.0, 2.0, 3.0]),
+                'pad': (2, 2),
+                'value': 0,
+            }
         )
 
         # Error cases

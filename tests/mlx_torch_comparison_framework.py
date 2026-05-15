@@ -23,15 +23,17 @@ from enum import Enum
 
 class TestType(Enum):
     """Types of tests to run"""
+
     OUTPUT = "output"  # Compare outputs
-    ERROR = "error"    # Compare error handling
-    SHAPE = "shape"    # Compare output shapes
-    DTYPE = "dtype"    # Compare data types
+    ERROR = "error"  # Compare error handling
+    SHAPE = "shape"  # Compare output shapes
+    DTYPE = "dtype"  # Compare data types
 
 
 @dataclass
 class TestCase:
     """Defines a single test case with inputs and expected behavior"""
+
     name: str
     inputs: Dict[str, Any]
     test_types: List[TestType] = None
@@ -49,12 +51,7 @@ class TestCase:
 class OperationTestSuite:
     """Base class for testing MLX operations against PyTorch references"""
 
-    def __init__(
-        self,
-        mlx_func: Callable,
-        torch_func: Callable,
-        name: str = None
-    ):
+    def __init__(self, mlx_func: Callable, torch_func: Callable, name: str = None):
         """
         Args:
             mlx_func: Your MLX implementation
@@ -75,7 +72,7 @@ class OperationTestSuite:
         atol: float = 1e-5,
         should_error: bool = False,
         error_type: Optional[type] = None,
-        description: str = ""
+        description: str = "",
     ):
         """Add a test case to the suite"""
         test_case = TestCase(
@@ -86,7 +83,7 @@ class OperationTestSuite:
             atol=atol,
             should_error=should_error,
             error_type=error_type,
-            description=description
+            description=description,
         )
         self.test_cases.append(test_case)
         return self
@@ -94,9 +91,10 @@ class OperationTestSuite:
     def _convert_to_mlx(self, obj):
         """Convert numpy arrays or tensors to MLX arrays"""
         import mlx.core as mx
+
         if isinstance(obj, np.ndarray):
             return mx.array(obj)
-        elif hasattr(obj, 'numpy'):  # torch tensor
+        elif hasattr(obj, "numpy"):  # torch tensor
             return mx.array(obj.numpy())
         elif isinstance(obj, (list, tuple)):
             return type(obj)(self._convert_to_mlx(item) for item in obj)
@@ -107,6 +105,7 @@ class OperationTestSuite:
     def _convert_to_torch(self, obj):
         """Convert numpy arrays to PyTorch tensors"""
         import torch
+
         if isinstance(obj, np.ndarray):
             return torch.from_numpy(obj)
         elif isinstance(obj, (list, tuple)):
@@ -117,9 +116,9 @@ class OperationTestSuite:
 
     def _to_numpy(self, obj):
         """Convert MLX array or PyTorch tensor to numpy"""
-        if hasattr(obj, 'numpy'):  # torch tensor or similar
+        if hasattr(obj, "numpy"):  # torch tensor or similar
             return obj.numpy()
-        elif hasattr(obj, '__array__'):  # numpy-like (including mx.array)
+        elif hasattr(obj, "__array__"):  # numpy-like (including mx.array)
             return np.array(obj)
         elif isinstance(obj, (list, tuple)):
             return type(obj)(self._to_numpy(item) for item in obj)
@@ -142,9 +141,14 @@ class OperationTestSuite:
             return False, f"Shape mismatch: MLX {mlx_np.shape} vs PyTorch {torch_np.shape}"
 
         if mlx_np.dtype != torch_np.dtype:
-            # Allow some dtype flexibility (e.g., float32 vs float64)
-            if not (np.issubdtype(mlx_np.dtype, np.floating) and
-                    np.issubdtype(torch_np.dtype, np.floating)):
+            # Allow some dtype flexibility (e.g., float32 vs float64 and complex64 vs complex128)
+            if not (
+                np.issubdtype(mlx_np.dtype, np.floating)
+                and np.issubdtype(torch_np.dtype, np.floating)
+            ) and not (
+                np.issubdtype(mlx_np.dtype, np.complexfloating)
+                and np.issubdtype(torch_np.dtype, np.complexfloating)
+            ):
                 return False, f"Dtype mismatch: MLX {mlx_np.dtype} vs PyTorch {torch_np.dtype}"
 
         try:
@@ -157,10 +161,10 @@ class OperationTestSuite:
     def run_test_case(self, test_case: TestCase) -> Dict[str, Any]:
         """Run a single test case and return results"""
         results = {
-            'passed': True,
-            'errors': [],
-            'test_name': test_case.name,
-            'description': test_case.description
+            "passed": True,
+            "errors": [],
+            "test_name": test_case.name,
+            "description": test_case.description,
         }
 
         # Prepare inputs
@@ -183,16 +187,16 @@ class OperationTestSuite:
                 torch_error = e
 
             if mlx_error is None:
-                results['passed'] = False
-                results['errors'].append("MLX function did not raise expected error")
+                results["passed"] = False
+                results["errors"].append("MLX function did not raise expected error")
 
             if torch_error is None:
-                results['passed'] = False
-                results['errors'].append("PyTorch function did not raise expected error")
+                results["passed"] = False
+                results["errors"].append("PyTorch function did not raise expected error")
 
             if test_case.error_type and not isinstance(mlx_error, test_case.error_type):
-                results['passed'] = False
-                results['errors'].append(
+                results["passed"] = False
+                results["errors"].append(
                     f"MLX error type mismatch: expected {test_case.error_type}, "
                     f"got {type(mlx_error)}"
                 )
@@ -203,15 +207,15 @@ class OperationTestSuite:
         try:
             mlx_result = self.mlx_func(**mlx_inputs)
         except Exception as e:
-            results['passed'] = False
-            results['errors'].append(f"MLX function raised error: {e}")
+            results["passed"] = False
+            results["errors"].append(f"MLX function raised error: {e}")
             return results
 
         try:
             torch_result = self.torch_func(**torch_inputs)
         except Exception as e:
-            results['passed'] = False
-            results['errors'].append(f"PyTorch function raised error: {e}")
+            results["passed"] = False
+            results["errors"].append(f"PyTorch function raised error: {e}")
             return results
 
         # Compare results based on test types
@@ -220,24 +224,24 @@ class OperationTestSuite:
                 mlx_result, torch_result, test_case.rtol, test_case.atol
             )
             if not passed:
-                results['passed'] = False
-                results['errors'].append(f"Output comparison failed: {msg}")
+                results["passed"] = False
+                results["errors"].append(f"Output comparison failed: {msg}")
 
         if TestType.SHAPE in test_case.test_types:
-            mlx_shape = getattr(mlx_result, 'shape', None)
-            torch_shape = getattr(torch_result, 'shape', None)
+            mlx_shape = getattr(mlx_result, "shape", None)
+            torch_shape = getattr(torch_result, "shape", None)
             if mlx_shape != torch_shape:
-                results['passed'] = False
-                results['errors'].append(
+                results["passed"] = False
+                results["errors"].append(
                     f"Shape mismatch: MLX {mlx_shape} vs PyTorch {torch_shape}"
                 )
 
         if TestType.DTYPE in test_case.test_types:
-            mlx_dtype = getattr(mlx_result, 'dtype', None)
-            torch_dtype = getattr(torch_result, 'dtype', None)
+            mlx_dtype = getattr(mlx_result, "dtype", None)
+            torch_dtype = getattr(torch_result, "dtype", None)
             if mlx_dtype != torch_dtype:
                 # Allow some flexibility in dtype comparison
-                results['errors'].append(
+                results["errors"].append(
                     f"Dtype difference: MLX {mlx_dtype} vs PyTorch {torch_dtype}"
                 )
 
@@ -273,11 +277,11 @@ class BaseOperationTest:
 
         for test_case in self.suite.test_cases:
             results = self.suite.run_test_case(test_case)
-            if not results['passed']:
+            if not results["passed"]:
                 error_msg = f"\nTest: {results['test_name']}\n"
-                if results['description']:
+                if results["description"]:
                     error_msg += f"Description: {results['description']}\n"
-                error_msg += "Errors:\n" + "\n".join(f"  - {e}" for e in results['errors'])
+                error_msg += "Errors:\n" + "\n".join(f"  - {e}" for e in results["errors"])
                 pytest.fail(error_msg)
 
 
@@ -290,11 +294,11 @@ def create_pytest_tests(test_suite: OperationTestSuite):
         """Parametrized test function"""
         results = test_suite.run_test_case(test_case)
 
-        if not results['passed']:
+        if not results["passed"]:
             error_msg = f"\nTest: {results['test_name']}\n"
-            if results['description']:
+            if results["description"]:
                 error_msg += f"Description: {results['description']}\n"
-            error_msg += "Errors:\n" + "\n".join(f"  - {e}" for e in results['errors'])
+            error_msg += "Errors:\n" + "\n".join(f"  - {e}" for e in results["errors"])
             pytest.fail(error_msg)
 
     return test_operation
