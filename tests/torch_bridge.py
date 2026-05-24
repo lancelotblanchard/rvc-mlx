@@ -95,6 +95,60 @@ def copy_res_encoder_block(torch_block, mlx_block) -> None:
         copy_conv_block_res(torch_conv_block, mlx_conv_block)
 
 
+def copy_conv_transpose2d(
+    torch_conv: torch.nn.ConvTranspose2d, mlx_conv: nn.ConvTranspose2d
+) -> None:
+    """
+    Copy weights from PyTorch ConvTranspose2d to MLX ConvTranspose2d.
+
+    PyTorch ConvTranspose2d weight shape: (in_channels, out_channels, kH, kW)
+    MLX     ConvTranspose2d weight shape: (out_channels, kH, kW, in_channels)
+    """
+    w = torch_conv.weight.detach().cpu().numpy().transpose(1, 2, 3, 0)
+    mlx_conv.weight = mx.array(w)
+    if torch_conv.bias is not None:
+        mlx_conv.bias = _to_mx(torch_conv.bias)
+
+
+def copy_res_decoder_block(torch_block, mlx_block) -> None:
+    """
+    Copy a `ResDecoderBlock` (ConvTranspose + BN + ReLU, then a stack of ConvBlockRes). Both implementations wrap the
+    transpose-convolution stage in an `nn.Sequential` of length 3.
+    """
+    torch_seq = torch_block.conv1
+    mlx_layers = mlx_block.conv1.layers
+    copy_conv_transpose2d(torch_seq[0], mlx_layers[0])
+    copy_batchnorm(torch_seq[1], mlx_layers[1])
+    for torch_conv_block, mlx_conv_block in zip(torch_block.conv2, mlx_block.conv2):
+        copy_conv_block_res(torch_conv_block, mlx_conv_block)
+
+
+def copy_encoder(torch_encoder, mlx_encoder) -> None:
+    """Copy the U-Net Encoder: top-level BatchNorm + a list of ResEncoderBlocks."""
+    copy_batchnorm(torch_encoder.bn, mlx_encoder.bn)
+    for torch_layer, mlx_layer in zip(torch_encoder.layers, mlx_encoder.layers):
+        copy_res_encoder_block(torch_layer, mlx_layer)
+
+
+def copy_intermediate(torch_inter, mlx_inter) -> None:
+    """Copy the U-Net Intermediate: a list of ResEncoderBlocks with kernel_size=None."""
+    for torch_layer, mlx_layer in zip(torch_inter.layers, mlx_inter.layers):
+        copy_res_encoder_block(torch_layer, mlx_layer)
+
+
+def copy_decoder(torch_decoder, mlx_decoder) -> None:
+    """Copy the U-Net Decoder: a list of ResDecoderBlocks."""
+    for torch_layer, mlx_layer in zip(torch_decoder.layers, mlx_decoder.layers):
+        copy_res_decoder_block(torch_layer, mlx_layer)
+
+
+def copy_deep_unet(torch_unet, mlx_unet) -> None:
+    """Copy the full DeepUnet (Encoder + Intermediate + Decoder)."""
+    copy_encoder(torch_unet.encoder, mlx_unet.encoder)
+    copy_intermediate(torch_unet.intermediate, mlx_unet.intermediate)
+    copy_decoder(torch_unet.decoder, mlx_unet.decoder)
+
+
 def to_channels_last(x: mx.array) -> mx.array:
     """Convert a 4D channels-first tensor (B, C, H, W) to MLX channels-last (B, H, W, C)."""
     return mx.transpose(x, (0, 2, 3, 1))

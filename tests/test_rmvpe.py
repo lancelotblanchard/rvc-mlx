@@ -12,11 +12,25 @@ import numpy as np
 import pytest
 import torch
 
-from rvc_mlx.rmvpe import ConvBlockRes, MelSpectrogram, ResEncoderBlock
+from rvc_mlx.rmvpe import (
+    ConvBlockRes,
+    Decoder,
+    DeepUnet,
+    Encoder,
+    Intermediate,
+    MelSpectrogram,
+    ResDecoderBlock,
+    ResEncoderBlock,
+)
 
 from .mlx_torch_comparison_framework import BaseOperationTest, OperationTestSuite
 from .torch_bridge import (
     copy_conv_block_res,
+    copy_decoder,
+    copy_deep_unet,
+    copy_encoder,
+    copy_intermediate,
+    copy_res_decoder_block,
     copy_res_encoder_block,
     randomize_bn_stats,
     set_eval,
@@ -493,6 +507,452 @@ class TestRmvpeResEncoderBlockNoPool(BaseOperationTest):
             name="no_pool_two_blocks",
             inputs={"x": rng.standard_normal((1, 16, 8, 32)).astype(np.float32)},
             description="Two ConvBlockRes without pooling (Intermediate-style)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Encoder, Intermediate, ResDecoderBlock, Decoder, DeepUnet.
+# Same paired-module strategy as ConvBlockRes / ResEncoderBlock above: build matched torch+MLX modules, copy weights and
+# BN running stats, run forward in eval mode, and compare. All inputs are channels-first PyTorch-shaped (B, C, H, W);
+# the MLX wrapper transposes to channels-last on the way in and back on the way out.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class _TorchEncoder(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC encoder (called `RmvpeEncoder` in the original)."""
+
+    def __init__(
+        self,
+        in_channels,
+        in_size,
+        n_encoders,
+        kernel_size,
+        n_blocks,
+        out_channels=16,
+        momentum=0.01,
+    ):
+        super().__init__()
+        self.n_encoders = n_encoders
+        self.bn = torch.nn.BatchNorm2d(in_channels, momentum=momentum)
+        self.layers = torch.nn.ModuleList()
+        for _ in range(n_encoders):
+            self.layers.append(
+                _TorchResEncoderBlock(in_channels, out_channels, kernel_size, n_blocks, momentum)
+            )
+            in_channels = out_channels
+            out_channels *= 2
+            in_size //= 2
+        self.out_size = in_size
+        self.out_channel = out_channels
+
+    def forward(self, x):
+        concat_tensors = []
+        x = self.bn(x)
+        for layer in self.layers:
+            t, x = layer(x)
+            concat_tensors.append(t)
+        return x, concat_tensors
+
+
+class _TorchIntermediate(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC Intermediate block."""
+
+    def __init__(self, in_channels, out_channels, n_inters, n_blocks, momentum=0.01):
+        super().__init__()
+        self.n_inters = n_inters
+        self.layers = torch.nn.ModuleList()
+        self.layers.append(_TorchResEncoderBlock(in_channels, out_channels, None, n_blocks, momentum))
+        for _ in range(n_inters - 1):
+            self.layers.append(_TorchResEncoderBlock(out_channels, out_channels, None, n_blocks, momentum))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class _TorchResDecoderBlock(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC ResDecoderBlock."""
+
+    def __init__(self, in_channels, out_channels, stride, n_blocks=1, momentum=0.01):
+        super().__init__()
+        out_padding = (0, 1) if stride == (1, 2) else (1, 1)
+        self.n_blocks = n_blocks
+        self.conv1 = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=(3, 3),
+                stride=stride,
+                padding=(1, 1),
+                output_padding=out_padding,
+                bias=False,
+            ),
+            torch.nn.BatchNorm2d(out_channels, momentum=momentum),
+            torch.nn.ReLU(),
+        )
+        self.conv2 = torch.nn.ModuleList()
+        self.conv2.append(_TorchConvBlockRes(out_channels * 2, out_channels, momentum))
+        for _ in range(n_blocks - 1):
+            self.conv2.append(_TorchConvBlockRes(out_channels, out_channels, momentum))
+
+    def forward(self, x, concat_tensor):
+        x = self.conv1(x)
+        x = torch.cat((x, concat_tensor), dim=1)
+        for conv2 in self.conv2:
+            x = conv2(x)
+        return x
+
+
+class _TorchDecoder(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC decoder (`RmvpeDecoder`)."""
+
+    def __init__(self, in_channels, n_decoders, stride, n_blocks, momentum=0.01):
+        super().__init__()
+        self.layers = torch.nn.ModuleList()
+        self.n_decoders = n_decoders
+        for _ in range(n_decoders):
+            out_channels = in_channels // 2
+            self.layers.append(
+                _TorchResDecoderBlock(in_channels, out_channels, stride, n_blocks, momentum)
+            )
+            in_channels = out_channels
+
+    def forward(self, x, concat_tensors):
+        for i, layer in enumerate(self.layers):
+            x = layer(x, concat_tensors[-1 - i])
+        return x
+
+
+class _TorchDeepUnet(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC DeepUnet."""
+
+    def __init__(
+        self,
+        kernel_size,
+        n_blocks,
+        en_de_layers=5,
+        inter_layers=4,
+        in_channels=1,
+        en_out_channels=16,
+    ):
+        super().__init__()
+        self.encoder = _TorchEncoder(
+            in_channels, 128, en_de_layers, kernel_size, n_blocks, en_out_channels
+        )
+        self.intermediate = _TorchIntermediate(
+            self.encoder.out_channel // 2,
+            self.encoder.out_channel,
+            inter_layers,
+            n_blocks,
+        )
+        self.decoder = _TorchDecoder(
+            self.encoder.out_channel, en_de_layers, kernel_size, n_blocks
+        )
+
+    def forward(self, x):
+        x, concat_tensors = self.encoder(x)
+        x = self.intermediate(x)
+        x = self.decoder(x, concat_tensors)
+        return x
+
+
+# ---------- Builders ---------------------------------------------------------------------------------------------------
+
+
+def _build_encoder_pair(in_channels, in_size, n_encoders, kernel_size, n_blocks, out_channels=16, seed=0):
+    torch.manual_seed(seed)
+    torch_mod = _TorchEncoder(in_channels, in_size, n_encoders, kernel_size, n_blocks, out_channels)
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = Encoder(in_channels, in_size, n_encoders, kernel_size, n_blocks, out_channels)
+    copy_encoder(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    # Encoder returns (x, concat_tensors); the framework compares a single array, so we test the bottleneck output and
+    # each skip tensor with separate suites. This builder returns the bottleneck-output wrapper.
+    def mlx_fn(x):
+        out, _ = mlx_mod(to_channels_last(x))
+        return to_channels_first(out)
+
+    def torch_fn(x):
+        with torch.no_grad():
+            out, _ = torch_mod(x)
+        return out
+
+    return mlx_fn, torch_fn, torch_mod, mlx_mod
+
+
+def _build_encoder_skip_pair(skip_index, *args, **kwargs):
+    """Build a pair that returns concat_tensors[skip_index] for shape-level comparison."""
+    torch.manual_seed(kwargs.get("seed", 0))
+    torch_mod = _TorchEncoder(*args, **{k: v for k, v in kwargs.items() if k != "seed"})
+    randomize_bn_stats(torch_mod, seed=kwargs.get("seed", 0))
+    mlx_mod = Encoder(*args, **{k: v for k, v in kwargs.items() if k != "seed"})
+    copy_encoder(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x):
+        _, concat = mlx_mod(to_channels_last(x))
+        return to_channels_first(concat[skip_index])
+
+    def torch_fn(x):
+        with torch.no_grad():
+            _, concat = torch_mod(x)
+        return concat[skip_index]
+
+    return mlx_fn, torch_fn
+
+
+def _build_intermediate_pair(in_channels, out_channels, n_inters, n_blocks, seed=0):
+    torch.manual_seed(seed)
+    torch_mod = _TorchIntermediate(in_channels, out_channels, n_inters, n_blocks)
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = Intermediate(in_channels, out_channels, n_inters, n_blocks)
+    copy_intermediate(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x):
+        return to_channels_first(mlx_mod(to_channels_last(x)))
+
+    def torch_fn(x):
+        with torch.no_grad():
+            return torch_mod(x)
+
+    return mlx_fn, torch_fn
+
+
+def _build_res_decoder_block_pair(in_channels, out_channels, stride, n_blocks=1, seed=0):
+    torch.manual_seed(seed)
+    torch_mod = _TorchResDecoderBlock(in_channels, out_channels, stride, n_blocks)
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = ResDecoderBlock(in_channels, out_channels, stride, n_blocks)
+    copy_res_decoder_block(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x, concat_tensor):
+        out = mlx_mod(to_channels_last(x), to_channels_last(concat_tensor))
+        return to_channels_first(out)
+
+    def torch_fn(x, concat_tensor):
+        with torch.no_grad():
+            return torch_mod(x, concat_tensor)
+
+    return mlx_fn, torch_fn
+
+
+def _build_decoder_pair(in_channels, n_decoders, stride, n_blocks, seed=0):
+    """
+    Build a Decoder pair. The framework calls the wrapper with kwargs, so the wrapper takes named skip tensors
+    `skip0`..`skipN-1` (encoder order: skip0 is the largest, consumed last by the decoder). The wrapper assembles them
+    into a list to match the real `Decoder.__call__` signature.
+    """
+    torch.manual_seed(seed)
+    torch_mod = _TorchDecoder(in_channels, n_decoders, stride, n_blocks)
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = Decoder(in_channels, n_decoders, stride, n_blocks)
+    copy_decoder(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x, **skips):
+        skip_list = [skips[f"skip{i}"] for i in range(n_decoders)]
+        skips_cl = [to_channels_last(s) for s in skip_list]
+        out = mlx_mod(to_channels_last(x), skips_cl)
+        return to_channels_first(out)
+
+    def torch_fn(x, **skips):
+        skip_list = [skips[f"skip{i}"] for i in range(n_decoders)]
+        with torch.no_grad():
+            return torch_mod(x, skip_list)
+
+    return mlx_fn, torch_fn
+
+
+def _build_deep_unet_pair(kernel_size, n_blocks, en_de_layers, inter_layers, in_channels=1, en_out_channels=16, seed=0):
+    torch.manual_seed(seed)
+    torch_mod = _TorchDeepUnet(kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels)
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = DeepUnet(kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels)
+    copy_deep_unet(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x):
+        return to_channels_first(mlx_mod(to_channels_last(x)))
+
+    def torch_fn(x):
+        with torch.no_grad():
+            return torch_mod(x)
+
+    return mlx_fn, torch_fn
+
+
+# ---------- Tests ------------------------------------------------------------------------------------------------------
+
+
+class TestRmvpeEncoderBottleneck(BaseOperationTest):
+    """Encoder output (the bottleneck tensor passed to Intermediate)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn, _, _ = _build_encoder_pair(
+            in_channels=1, in_size=128, n_encoders=3, kernel_size=(2, 2), n_blocks=1, out_channels=8
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "encoder_bottleneck")
+
+        rng = np.random.default_rng(10)
+        cls.suite.add_test_case(
+            name="bottleneck_basic",
+            inputs={"x": rng.standard_normal((1, 1, 32, 128)).astype(np.float32)},
+            description="3-layer Encoder; spatial dims divide by 2^3 = 8",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeEncoderSkip0(BaseOperationTest):
+    """Encoder skip tensor at layer 0 (largest spatial size)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_encoder_skip_pair(
+            0, 1, 128, 3, (2, 2), 1, 8
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "encoder_skip_0")
+
+        rng = np.random.default_rng(11)
+        cls.suite.add_test_case(
+            name="skip_0",
+            inputs={"x": rng.standard_normal((1, 1, 32, 128)).astype(np.float32)},
+            description="First skip tensor (pre-pool output of layer 0)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeEncoderSkipLast(BaseOperationTest):
+    """Encoder skip tensor at the last layer (smallest spatial size)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_encoder_skip_pair(
+            2, 1, 128, 3, (2, 2), 1, 8
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "encoder_skip_last")
+
+        rng = np.random.default_rng(12)
+        cls.suite.add_test_case(
+            name="skip_last",
+            inputs={"x": rng.standard_normal((1, 1, 32, 128)).astype(np.float32)},
+            description="Last skip tensor (pre-pool output of the deepest encoder layer)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeIntermediate(BaseOperationTest):
+    """Intermediate block (stack of ResEncoderBlock with kernel_size=None)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_intermediate_pair(
+            in_channels=16, out_channels=32, n_inters=2, n_blocks=1
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "intermediate")
+
+        rng = np.random.default_rng(13)
+        cls.suite.add_test_case(
+            name="intermediate_basic",
+            inputs={"x": rng.standard_normal((1, 16, 8, 16)).astype(np.float32)},
+            description="Intermediate increases channels (16 -> 32) without changing spatial size",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeResDecoderBlock(BaseOperationTest):
+    """ResDecoderBlock (transpose conv upsample + concat with skip + ConvBlockRes stack)."""
+
+    @classmethod
+    def setup_class(cls):
+        # Stride (2, 2) doubles each spatial dim. Input (B, in, 8, 8) and skip (B, out, 16, 16).
+        mlx_fn, torch_fn = _build_res_decoder_block_pair(
+            in_channels=32, out_channels=16, stride=(2, 2), n_blocks=1
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "res_decoder_block")
+
+        rng = np.random.default_rng(14)
+        cls.suite.add_test_case(
+            name="res_decoder_basic",
+            inputs={
+                "x": rng.standard_normal((1, 32, 8, 8)).astype(np.float32),
+                "concat_tensor": rng.standard_normal((1, 16, 16, 16)).astype(np.float32),
+            },
+            description="Upsample 8x8 -> 16x16, concat with 16x16 skip, run ConvBlockRes",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeDecoder(BaseOperationTest):
+    """Full Decoder: a list of ResDecoderBlocks consuming the encoder's skip tensors in reverse order."""
+
+    @classmethod
+    def setup_class(cls):
+        # Build a 3-layer decoder mirroring a 3-layer encoder. In_channels halve each step: 32 -> 16 -> 8 -> 4.
+        # Skip tensors expected per layer (channels-first), in encoder order (decoder consumes them in reverse).
+        # After encoder layers 0/1/2 starting from (32, 128): pooled produces (8, 64), (16, 32), (32, 16).
+        # We mimic that here with synthetic skips.
+        mlx_fn, torch_fn = _build_decoder_pair(
+            in_channels=32,
+            n_decoders=3,
+            stride=(2, 2),
+            n_blocks=1,
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "decoder")
+
+        # Decoder iteration i: ConvTranspose maps in_channels // 2^i -> in_channels // 2^(i+1), then concatenates with
+        # concat_tensors[-1 - i] (encoder skip from layer N-1-i). The skip tensor's channel count must match the
+        # upsampled output's channel count, and its spatial dims must match the upsampled spatial dims (input * 2^(i+1)).
+        rng = np.random.default_rng(15)
+        cls.suite.add_test_case(
+            name="decoder_basic",
+            inputs={
+                "x": rng.standard_normal((1, 32, 4, 4)).astype(np.float32),
+                # skip0 is consumed at decoder step 2 (deepest unroll): spatial (32, 32), 4 channels.
+                "skip0": rng.standard_normal((1, 4, 32, 32)).astype(np.float32),
+                # skip1 is consumed at decoder step 1: spatial (16, 16), 8 channels.
+                "skip1": rng.standard_normal((1, 8, 16, 16)).astype(np.float32),
+                # skip2 is consumed at decoder step 0 (first): spatial (8, 8), 16 channels.
+                "skip2": rng.standard_normal((1, 16, 8, 8)).astype(np.float32),
+            },
+            description="3-step decoder unrolling 4x4 -> 32x32, concatenating with three skip tensors",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeDeepUnet(BaseOperationTest):
+    """End-to-end DeepUnet: Encoder + Intermediate + Decoder."""
+
+    @classmethod
+    def setup_class(cls):
+        # Match RVC default architecture but with a smaller depth/channel count to keep the test cheap.
+        mlx_fn, torch_fn = _build_deep_unet_pair(
+            kernel_size=(2, 2),
+            n_blocks=1,
+            en_de_layers=3,
+            inter_layers=2,
+            in_channels=1,
+            en_out_channels=8,
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "deep_unet")
+
+        rng = np.random.default_rng(16)
+        cls.suite.add_test_case(
+            name="deep_unet_basic",
+            inputs={"x": rng.standard_normal((1, 1, 32, 128)).astype(np.float32)},
+            description="Full DeepUnet forward; output has the same spatial size as input and en_out_channels channels",
             atol=1e-4,
             rtol=1e-4,
         )
