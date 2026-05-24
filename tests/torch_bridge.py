@@ -149,6 +149,90 @@ def copy_deep_unet(torch_unet, mlx_unet) -> None:
     copy_decoder(torch_unet.decoder, mlx_unet.decoder)
 
 
+def _copy_single_gru(
+    t_weight_ih: torch.Tensor,
+    t_weight_hh: torch.Tensor,
+    t_bias_ih: torch.Tensor,
+    t_bias_hh: torch.Tensor,
+    mlx_gru: nn.GRU,
+) -> None:
+    """
+    Copy the four tensors of one direction/layer of a PyTorch GRU into one MLX `nn.GRU`.
+
+    PyTorch parameter layouts (all gates in the order r, z, n):
+        weight_ih: (3 * hidden, input)
+        weight_hh: (3 * hidden, hidden)
+        bias_ih:   (3 * hidden,)
+        bias_hh:   (3 * hidden,)
+
+    MLX `nn.GRU` parameter layouts (also r, z, n):
+        Wx: (3 * hidden, input)    -- same as weight_ih
+        Wh: (3 * hidden, hidden)   -- same as weight_hh
+        b:  (3 * hidden,)          -- the r/z slots get bias_ih + bias_hh; the n slot gets bias_ih only
+        bhn:(hidden,)              -- the n slot's hidden bias, taken from bias_hh[2H:3H]
+
+    The split is necessary because MLX applies `bhn` inside the reset-gate-gated path:
+    `n = tanh(W_xn x + b_n + r * (W_hn h + bhn))`, matching PyTorch's
+    `n = tanh(W_in x + b_in + r * (W_hn h + b_hn))`.
+    """
+    H = mlx_gru.hidden_size
+    weight_ih = t_weight_ih.detach().cpu().numpy()
+    weight_hh = t_weight_hh.detach().cpu().numpy()
+    bias_ih = t_bias_ih.detach().cpu().numpy()
+    bias_hh = t_bias_hh.detach().cpu().numpy()
+
+    mlx_gru.Wx = mx.array(weight_ih)
+    mlx_gru.Wh = mx.array(weight_hh)
+
+    combined_b = bias_ih.copy()
+    combined_b[: 2 * H] = bias_ih[: 2 * H] + bias_hh[: 2 * H]  # r and z gates
+    # n gate's b stays as bias_ih[2H:3H] (already in combined_b from the .copy()).
+    mlx_gru.b = mx.array(combined_b)
+    mlx_gru.bhn = mx.array(bias_hh[2 * H : 3 * H])
+
+
+def copy_bi_gru(torch_gru: torch.nn.GRU, mlx_bigru) -> None:
+    """
+    Copy a PyTorch bidirectional, multi-layer `nn.GRU` into our `BiGRU` (which is built from MLX's single-direction
+    primitives). For layer i, PyTorch exposes:
+        weight_ih_l{i}, weight_hh_l{i}, bias_ih_l{i}, bias_hh_l{i}                     -- forward
+        weight_ih_l{i}_reverse, weight_hh_l{i}_reverse, bias_ih_l{i}_reverse, bias_hh_l{i}_reverse  -- backward
+    """
+    assert torch_gru.bidirectional, "copy_bi_gru expects a bidirectional torch GRU"
+    for i, (fgru, bgru) in enumerate(zip(mlx_bigru.forward_grus, mlx_bigru.backward_grus)):
+        _copy_single_gru(
+            getattr(torch_gru, f"weight_ih_l{i}"),
+            getattr(torch_gru, f"weight_hh_l{i}"),
+            getattr(torch_gru, f"bias_ih_l{i}"),
+            getattr(torch_gru, f"bias_hh_l{i}"),
+            fgru,
+        )
+        _copy_single_gru(
+            getattr(torch_gru, f"weight_ih_l{i}_reverse"),
+            getattr(torch_gru, f"weight_hh_l{i}_reverse"),
+            getattr(torch_gru, f"bias_ih_l{i}_reverse"),
+            getattr(torch_gru, f"bias_hh_l{i}_reverse"),
+            bgru,
+        )
+
+
+def copy_linear(torch_linear: torch.nn.Linear, mlx_linear: nn.Linear) -> None:
+    """PyTorch and MLX Linear share weight shape (out, in) and bias shape (out,)."""
+    mlx_linear.weight = _to_mx(torch_linear.weight)
+    if torch_linear.bias is not None:
+        mlx_linear.bias = _to_mx(torch_linear.bias)
+
+
+def copy_e2e(torch_e2e, mlx_e2e) -> None:
+    """Copy the full E2E pitch network (DeepUnet + Conv + BiGRU + Linear)."""
+    copy_deep_unet(torch_e2e.unet, mlx_e2e.unet)
+    copy_conv2d(torch_e2e.cnn, mlx_e2e.cnn)
+    # The reference wraps BiGRU + Linear + Dropout + Sigmoid in a single `fc = nn.Sequential(...)`.
+    torch_fc = torch_e2e.fc
+    copy_bi_gru(torch_fc[0].gru, mlx_e2e.gru)
+    copy_linear(torch_fc[1], mlx_e2e.linear)
+
+
 def to_channels_last(x: mx.array) -> mx.array:
     """Convert a 4D channels-first tensor (B, C, H, W) to MLX channels-last (B, H, W, C)."""
     return mx.transpose(x, (0, 2, 3, 1))

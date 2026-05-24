@@ -13,21 +13,26 @@ import pytest
 import torch
 
 from rvc_mlx.rmvpe import (
+    BiGRU,
     ConvBlockRes,
     Decoder,
     DeepUnet,
+    E2E,
     Encoder,
     Intermediate,
     MelSpectrogram,
     ResDecoderBlock,
     ResEncoderBlock,
+    RMVPE,
 )
 
 from .mlx_torch_comparison_framework import BaseOperationTest, OperationTestSuite
 from .torch_bridge import (
+    copy_bi_gru,
     copy_conv_block_res,
     copy_decoder,
     copy_deep_unet,
+    copy_e2e,
     copy_encoder,
     copy_intermediate,
     copy_res_decoder_block,
@@ -955,6 +960,385 @@ class TestRmvpeDeepUnet(BaseOperationTest):
             description="Full DeepUnet forward; output has the same spatial size as input and en_out_channels channels",
             atol=1e-4,
             rtol=1e-4,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# BiGRU and E2E
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class _TorchBiGRU(torch.nn.Module):
+    """Faithful PyTorch reference: a bidirectional, multi-layer GRU."""
+
+    def __init__(self, input_features, hidden_features, num_layers):
+        super().__init__()
+        self.gru = torch.nn.GRU(
+            input_features,
+            hidden_features,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+    def forward(self, x):
+        return self.gru(x)[0]
+
+
+class _TorchE2E(torch.nn.Module):
+    """Faithful PyTorch reference for the RVC E2E pitch network (n_gru > 0 path only)."""
+
+    def __init__(
+        self,
+        n_blocks,
+        n_gru,
+        kernel_size,
+        en_de_layers=5,
+        inter_layers=4,
+        in_channels=1,
+        en_out_channels=16,
+    ):
+        super().__init__()
+        self.unet = _TorchDeepUnet(
+            kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels
+        )
+        self.cnn = torch.nn.Conv2d(en_out_channels, 3, (3, 3), padding=(1, 1))
+        self.fc = torch.nn.Sequential(
+            _TorchBiGRU(3 * 128, 256, n_gru),
+            torch.nn.Linear(512, 360),
+            torch.nn.Dropout(0.25),
+            torch.nn.Sigmoid(),
+        )
+
+    def forward(self, mel):
+        mel = mel.transpose(-1, -2).unsqueeze(1)
+        x = self.cnn(self.unet(mel)).transpose(1, 2).flatten(-2)
+        return self.fc(x)
+
+
+def _build_bi_gru_pair(input_features, hidden_features, num_layers, seed=0):
+    torch.manual_seed(seed)
+    torch_mod = _TorchBiGRU(input_features, hidden_features, num_layers)
+    mlx_mod = BiGRU(input_features, hidden_features, num_layers)
+    copy_bi_gru(torch_mod.gru, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(x):
+        return mlx_mod(x)
+
+    def torch_fn(x):
+        with torch.no_grad():
+            return torch_mod(x)
+
+    return mlx_fn, torch_fn
+
+
+def _build_e2e_pair(
+    n_blocks, n_gru, kernel_size, en_de_layers, inter_layers, in_channels=1, en_out_channels=16, seed=0
+):
+    torch.manual_seed(seed)
+    torch_mod = _TorchE2E(
+        n_blocks, n_gru, kernel_size, en_de_layers, inter_layers, in_channels, en_out_channels
+    )
+    randomize_bn_stats(torch_mod, seed=seed)
+    mlx_mod = E2E(
+        n_blocks, n_gru, kernel_size, en_de_layers, inter_layers, in_channels, en_out_channels
+    )
+    copy_e2e(torch_mod, mlx_mod)
+    set_eval(torch_mod, mlx_mod)
+
+    def mlx_fn(mel):
+        return mlx_mod(mel)
+
+    def torch_fn(mel):
+        with torch.no_grad():
+            return torch_mod(mel)
+
+    return mlx_fn, torch_fn, mlx_mod, torch_mod
+
+
+class TestRmvpeBiGRUSingleLayer(BaseOperationTest):
+    """One-layer bidirectional GRU."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_bi_gru_pair(input_features=16, hidden_features=8, num_layers=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "bi_gru_1_layer")
+
+        rng = np.random.default_rng(20)
+        cls.suite.add_test_case(
+            name="bi_gru_basic",
+            inputs={"x": rng.standard_normal((1, 12, 16)).astype(np.float32)},
+            description="Single-layer bidirectional GRU; output is (B, T, 2*hidden)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        cls.suite.add_test_case(
+            name="bi_gru_batched",
+            inputs={"x": rng.standard_normal((3, 20, 16)).astype(np.float32)},
+            description="Batched single-layer bidirectional GRU",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestRmvpeBiGRUMultiLayer(BaseOperationTest):
+    """Two-layer bidirectional GRU (the RVC RMVPE configuration uses n_gru=1, but multi-layer should also work)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_bi_gru_pair(input_features=16, hidden_features=8, num_layers=2)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "bi_gru_2_layers")
+
+        rng = np.random.default_rng(21)
+        cls.suite.add_test_case(
+            name="bi_gru_two_layers",
+            inputs={"x": rng.standard_normal((1, 12, 16)).astype(np.float32)},
+            description="Two-layer bidirectional GRU; second layer takes 2*hidden as input",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+# The RVC RMVPE E2E uses en_de_layers=5, inter_layers=4, en_out_channels=16, n_blocks=4, n_gru=1. That's expensive,
+# so we exercise a shrunk version that still hits the full code path (DeepUnet + Conv + BiGRU + Linear + sigmoid).
+_E2E_TEST_CONFIG = dict(
+    n_blocks=1,
+    n_gru=1,
+    kernel_size=(2, 2),
+    en_de_layers=3,
+    inter_layers=2,
+    in_channels=1,
+    en_out_channels=8,
+)
+
+
+class TestRmvpeE2E(BaseOperationTest):
+    """End-to-end E2E pitch network forward pass."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn, _, _ = _build_e2e_pair(**_E2E_TEST_CONFIG)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "e2e")
+
+        rng = np.random.default_rng(22)
+        # Time dim must be a multiple of 2 ** en_de_layers = 8 for the U-Net to downsample evenly. n_mel is fixed at 128
+        # by the reference (the in_size of the U-Net).
+        cls.suite.add_test_case(
+            name="e2e_basic",
+            inputs={"mel": rng.standard_normal((1, 128, 32)).astype(np.float32)},
+            description="E2E forward; output shape (B, T, 360)",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# RMVPE orchestration (mel2hidden, to_local_average_cents, decode, infer_from_audio).
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class _TorchRMVPE:
+    """
+    PyTorch reference orchestration class mirroring the RVC `RMVPE`. We reproduce only the inference path
+    (mel extraction, padding to multiple of 32, model forward, salience decoding) and not the checkpoint-loading or
+    JIT-export plumbing, since those are unrelated to the numerical behavior under test.
+    """
+
+    _CENTS_OFFSET = 1997.3794084376191
+    _CENTS_STEP = 20
+    _NUM_BINS = 360
+    _PAD = 4
+
+    def __init__(self, model, is_half=False):
+        self.is_half = is_half
+        self.model = model
+        self.mel_extractor = _TorchMelSpectrogram(
+            is_half=is_half,
+            n_mel_channels=128,
+            sampling_rate=16000,
+            win_length=1024,
+            hop_length=160,
+            mel_fmin=30,
+            mel_fmax=8000,
+        )
+        self.mel_extractor.eval()
+        cents_mapping = self._CENTS_STEP * np.arange(self._NUM_BINS) + self._CENTS_OFFSET
+        self.cents_mapping = np.pad(cents_mapping, (self._PAD, self._PAD))
+
+    def mel2hidden(self, mel):
+        with torch.no_grad():
+            n_frames = mel.shape[-1]
+            n_pad = 32 * ((n_frames - 1) // 32 + 1) - n_frames
+            if n_pad > 0:
+                mel = torch.nn.functional.pad(mel, (0, n_pad), mode="constant")
+            if self.is_half:
+                mel = mel.half()
+            hidden = self.model(mel)
+            return hidden[..., :n_frames, :]
+
+    def to_local_average_cents(self, salience, thred=0.05):
+        salience_np = salience.detach().cpu().numpy() if isinstance(salience, torch.Tensor) else np.asarray(salience)
+        center = np.argmax(salience_np, axis=-1)
+        padded = np.pad(salience_np, [(0, 0)] * (salience_np.ndim - 1) + [(self._PAD, self._PAD)])
+        window_size = 2 * self._PAD + 1
+        offsets = np.arange(window_size)
+        idx = center[..., None] + offsets
+        gathered = np.take_along_axis(padded, idx, axis=-1)
+        cents_window = self.cents_mapping[idx]
+        product_sum = np.sum(gathered * cents_window, axis=-1)
+        weight_sum = np.sum(gathered, axis=-1)
+        weight_sum = np.where(weight_sum == 0, 1.0, weight_sum)
+        devided = product_sum / weight_sum
+        maxx = np.max(salience_np, axis=-1)
+        devided = np.where(maxx <= thred, 0.0, devided)
+        return devided
+
+    def decode(self, hidden, thred=0.03):
+        cents_pred = self.to_local_average_cents(hidden, thred=thred)
+        f0 = 10 * (2 ** (cents_pred / 1200))
+        f0 = np.where(f0 == 10, 0.0, f0)
+        return f0
+
+    def infer_from_audio(self, audio, thred=0.03):
+        mel = self.mel_extractor(audio)
+        hidden = self.mel2hidden(mel)
+        return self.decode(hidden, thred=thred)
+
+
+def _build_rmvpe_pair(**e2e_config):
+    """Construct matched MLX and PyTorch RMVPE orchestrators with weight-bridged E2E networks."""
+    seed = e2e_config.pop("seed", 0)
+    torch.manual_seed(seed)
+    torch_e2e = _TorchE2E(**e2e_config)
+    randomize_bn_stats(torch_e2e, seed=seed)
+    mlx_e2e = E2E(**e2e_config)
+    copy_e2e(torch_e2e, mlx_e2e)
+    # Both networks must be in eval mode; otherwise BatchNorm uses batch statistics (training mode) and the bridge's
+    # running-stat copy is ignored. This was a subtle source of ~0.28 max-abs divergence before being added.
+    set_eval(torch_e2e, mlx_e2e)
+
+    mlx_rmvpe = RMVPE(model=mlx_e2e, is_half=False)
+    torch_rmvpe = _TorchRMVPE(model=torch_e2e, is_half=False)
+    return mlx_rmvpe, torch_rmvpe
+
+
+class TestRmvpeMel2Hidden(BaseOperationTest):
+    """`mel2hidden` pads time to a multiple of 32, runs the network, then trims back to the original frame count."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_rmvpe, torch_rmvpe = _build_rmvpe_pair(**_E2E_TEST_CONFIG)
+
+        def mlx_fn(mel):
+            return mlx_rmvpe.mel2hidden(mel)
+
+        def torch_fn(mel):
+            return torch_rmvpe.mel2hidden(mel)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "mel2hidden")
+
+        rng = np.random.default_rng(30)
+        # Pick a non-multiple of 32 so the padding branch fires.
+        cls.suite.add_test_case(
+            name="mel2hidden_pads",
+            inputs={"mel": rng.standard_normal((1, 128, 50)).astype(np.float32)},
+            description="50 frames -> padded to 64 -> trimmed back to 50",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        cls.suite.add_test_case(
+            name="mel2hidden_already_aligned",
+            inputs={"mel": rng.standard_normal((1, 128, 32)).astype(np.float32)},
+            description="No-pad path: 32 frames is already a multiple of 32",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+class TestRmvpeToLocalAverageCents(BaseOperationTest):
+    """`to_local_average_cents` decoding is pure NumPy and must match exactly."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_rmvpe, torch_rmvpe = _build_rmvpe_pair(**_E2E_TEST_CONFIG)
+
+        def mlx_fn(salience, thred):
+            return mlx_rmvpe.to_local_average_cents(salience, thred=thred)
+
+        def torch_fn(salience, thred):
+            return torch_rmvpe.to_local_average_cents(salience, thred=thred)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "to_local_average_cents")
+
+        rng = np.random.default_rng(31)
+        salience = rng.uniform(size=(1, 16, 360)).astype(np.float32)
+        # Some frames intentionally low-salience so the threshold branch fires.
+        salience[0, 4] *= 0.001
+        salience[0, 9] *= 0.001
+        cls.suite.add_test_case(
+            name="local_average_basic",
+            inputs={"salience": salience, "thred": 0.05},
+            description="Decoded cents per frame, with some frames below the salience threshold",
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+class TestRmvpeDecode(BaseOperationTest):
+    """`decode` composes `to_local_average_cents` with the cents -> Hz formula."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_rmvpe, torch_rmvpe = _build_rmvpe_pair(**_E2E_TEST_CONFIG)
+
+        def mlx_fn(hidden, thred):
+            return mlx_rmvpe.decode(hidden, thred=thred)
+
+        def torch_fn(hidden, thred):
+            return torch_rmvpe.decode(hidden, thred=thred)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "decode")
+
+        rng = np.random.default_rng(32)
+        cls.suite.add_test_case(
+            name="decode_basic",
+            inputs={
+                "hidden": rng.uniform(size=(1, 16, 360)).astype(np.float32),
+                "thred": 0.03,
+            },
+            description="Decode random salience to f0 (Hz). Unvoiced frames map to 0.",
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+class TestRmvpeInferFromAudio(BaseOperationTest):
+    """Full RMVPE pipeline: raw audio -> mel -> hidden -> f0."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_rmvpe, torch_rmvpe = _build_rmvpe_pair(**_E2E_TEST_CONFIG)
+
+        def mlx_fn(audio, thred):
+            return mlx_rmvpe.infer_from_audio(audio, thred=thred)
+
+        def torch_fn(audio, thred):
+            return torch_rmvpe.infer_from_audio(audio, thred=thred)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "infer_from_audio")
+
+        rng = np.random.default_rng(33)
+        # 1 s of 16 kHz audio. With hop_length=160 we get 101 mel frames (with center=True).
+        cls.suite.add_test_case(
+            name="infer_basic",
+            inputs={
+                "audio": rng.standard_normal((1, 16000)).astype(np.float32),
+                "thred": 0.03,
+            },
+            description="End-to-end inference; random weights so output values are arbitrary, but MLX and PyTorch agree",
+            atol=1e-2,
+            rtol=1e-2,
         )
 
 

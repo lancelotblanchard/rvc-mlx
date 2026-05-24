@@ -311,3 +311,186 @@ class DeepUnet(nn.Module):
         x = self.intermediate(x)
         x = self.decoder(x, concat_tensors)
         return x
+
+
+class BiGRU(nn.Module):
+    """
+    Bidirectional, multi-layer GRU built from MLX's single-direction, single-layer `nn.GRU` primitives. Mirrors
+    `torch.nn.GRU(input_features, hidden_features, num_layers=num_layers, batch_first=True, bidirectional=True)`.
+
+    For each layer, the input is fed through a forward GRU and a backward GRU (which runs over the reversed sequence,
+    then the output is re-reversed). The two outputs are concatenated along the feature axis, and the next layer takes
+    that as input. The initial hidden state is explicit zeros so that the first time-step's bias contribution matches
+    PyTorch's behavior (MLX `nn.GRU` skips the recurrent bias terms when `hidden is None`).
+    """
+
+    def __init__(self, input_features: int, hidden_features: int, num_layers: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_features = hidden_features
+        self.forward_grus: List[nn.GRU] = []
+        self.backward_grus: List[nn.GRU] = []
+        for i in range(num_layers):
+            in_feat = input_features if i == 0 else 2 * hidden_features
+            self.forward_grus.append(nn.GRU(in_feat, hidden_features))
+            self.backward_grus.append(nn.GRU(in_feat, hidden_features))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: (B, T, D). Returns (B, T, 2 * hidden_features).
+        # MLX 0.30 does not have `mx.flip`; we reverse the time axis (-2) with a negative-step slice instead.
+        batch = x.shape[0]
+        h0 = mx.zeros((batch, self.hidden_features))
+        for fgru, bgru in zip(self.forward_grus, self.backward_grus):
+            f_out = fgru(x, hidden=h0)
+            b_out = bgru(x[:, ::-1, :], hidden=h0)
+            b_out = b_out[:, ::-1, :]
+            x = mx.concatenate([f_out, b_out], axis=-1)
+        return x
+
+
+class E2E(nn.Module):
+    """
+    End-to-end RMVPE pitch network: a `DeepUnet` followed by a 3x3 Conv, then a `BiGRU` + `Linear` + sigmoid head that
+    projects each time step to 360 cents bins.
+
+    The PyTorch reference takes `mel` in shape (B, n_mel, T) (channels-first) and rearranges via
+    `mel.transpose(-1, -2).unsqueeze(1)` to (B, 1, T, n_mel). Our `__call__` accepts the same (B, n_mel, T) shape and
+    does the equivalent rearrangement to MLX channels-last (B, T, n_mel, 1) internally.
+    """
+
+    def __init__(
+        self,
+        n_blocks: int,
+        n_gru: int,
+        kernel_size: tuple,
+        en_de_layers: int = 5,
+        inter_layers: int = 4,
+        in_channels: int = 1,
+        en_out_channels: int = 16,
+    ):
+        super().__init__()
+        if not n_gru:
+            raise NotImplementedError("E2E without GRU layers is not supported (n_gru must be > 0).")
+        self.unet = DeepUnet(
+            kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels
+        )
+        # The reference uses Conv2d(en_out_channels, 3, kernel_size=(3, 3), padding=(1, 1)).
+        self.cnn = nn.Conv2d(en_out_channels, 3, kernel_size=3, padding=1)
+        # BiGRU input is 3 * 128 = 384 because the U-Net preserves the in_size of 128 along the mel axis.
+        self.gru = BiGRU(3 * 128, 256, n_gru)
+        self.linear = nn.Linear(512, 360)
+        # Dropout(0.25) and Sigmoid are part of the reference's `fc` Sequential. Dropout is a no-op in eval mode and
+        # MLX's Sigmoid is just `mx.sigmoid`; we apply both explicitly so the eval-time output matches PyTorch exactly.
+
+    def __call__(self, mel: mx.array) -> mx.array:
+        # mel: (B, n_mel, T) -> (B, T, n_mel, 1) for MLX channels-last conv.
+        x = mx.expand_dims(mx.transpose(mel, (0, 2, 1)), -1)
+        x = self.unet(x)  # (B, T, n_mel, en_out_channels)
+        x = self.cnn(x)  # (B, T, n_mel, 3)
+        # PyTorch path is `x.transpose(1, 2).flatten(-2)` on (B, 3, T, n_mel) -> (B, T, 3, n_mel) -> (B, T, 3 * n_mel).
+        # Mirror that ordering by permuting channels-last (B, T, n_mel, 3) -> (B, T, 3, n_mel) before flattening.
+        x = mx.transpose(x, (0, 1, 3, 2))  # (B, T, 3, n_mel)
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # (B, T, 3 * n_mel)
+        x = self.gru(x)
+        x = self.linear(x)
+        x = mx.sigmoid(x)
+        return x
+
+
+class RMVPE:
+    """
+    Orchestration wrapper around `MelSpectrogram` and the `E2E` pitch network. Mirrors the inference path of the RVC
+    reference `RMVPE` class: extract a 128-bin log-mel spectrogram from raw audio, pass it through the network to get
+    a 360-bin frame-level salience, then decode the salience to fundamental-frequency (f0) estimates in Hz.
+
+    The reference loads its E2E weights from a PyTorch `.pt` checkpoint. Here we take the `E2E` instance directly via
+    the constructor so the orchestration code stays decoupled from checkpoint loading. A separate helper can copy
+    weights from a torch E2E into an MLX E2E using the paired-module bridge in tests.
+    """
+
+    # The 360 output bins span pitches starting at ~32.7 Hz (C1) in 20-cent increments. The reference pads four bins on
+    # each side so the local-average-cents weighted mean has 9 neighbours to look at without bounds checks.
+    _CENTS_OFFSET = 1997.3794084376191
+    _CENTS_STEP = 20
+    _NUM_BINS = 360
+    _PAD = 4
+
+    def __init__(self, model: E2E, is_half: bool = False):
+        self.is_half = is_half
+        self.mel_extractor = MelSpectrogram(
+            is_half=is_half,
+            n_mel_channels=128,
+            sampling_rate=16000,
+            win_length=1024,
+            hop_length=160,
+            n_fft=None,
+            mel_fmin=30,
+            mel_fmax=8000,
+        )
+        self.model = model
+        cents_mapping = self._CENTS_STEP * np.arange(self._NUM_BINS) + self._CENTS_OFFSET
+        # Pad on both sides so windowed neighbours around bin 0 / NUM_BINS-1 stay in range without index clamping.
+        self.cents_mapping = np.pad(cents_mapping, (self._PAD, self._PAD))  # length: NUM_BINS + 2 * PAD = 368
+
+    def mel2hidden(self, mel: mx.array) -> mx.array:
+        """
+        Run a log-mel spectrogram through the E2E network. The reference pads the time axis to a multiple of 32 (the
+        encoder's spatial reduction factor is 2 ** 5 = 32) so the U-Net can downsample cleanly, then crops the model
+        output back to the original number of frames.
+        """
+        n_frames = mel.shape[-1]
+        n_pad = 32 * ((n_frames - 1) // 32 + 1) - n_frames
+        if n_pad > 0:
+            # Pad only the time (last) axis on the right. Constant (zero) padding matches the reference.
+            mel = pad_constant(mel, (0, n_pad), value=0.0)
+        if self.is_half:
+            mel = mel.astype(mx.float16)
+        hidden = self.model(mel)
+        return hidden[..., :n_frames, :]
+
+    def to_local_average_cents(self, salience: mx.array, thred: float = 0.05) -> np.ndarray:
+        """
+        Convert a frame-level salience map of shape (..., T, 360) into per-frame cents estimates using a 9-bin
+        local weighted mean around the argmax bin. Frames whose peak salience is below `thred` are zeroed out.
+        Mirrors the reference's `to_local_average_cents` and runs on NumPy because the indexing patterns are easier to
+        express there and the cost is negligible compared to the network forward.
+        """
+        salience_np = np.array(salience)
+        center = np.argmax(salience_np, axis=-1)  # (..., T)
+        # Pad along the last dim so center +/- 4 stays in bounds.
+        padded = np.pad(salience_np, [(0, 0)] * (salience_np.ndim - 1) + [(self._PAD, self._PAD)])
+        # Build a windowed view of length 9 (= 2*PAD + 1) around each center.
+        window_size = 2 * self._PAD + 1
+        offsets = np.arange(window_size)  # 0..8
+        # `center + offsets` (broadcasting) gives indices into the padded salience for each frame.
+        idx = center[..., None] + offsets  # (..., T, 9)
+        gathered = np.take_along_axis(padded, idx, axis=-1)  # (..., T, 9)
+        # `cents_mapping` is also length 368; index it with the same window so the cents values align.
+        cents_window = self.cents_mapping[idx]  # (..., T, 9)
+        product_sum = np.sum(gathered * cents_window, axis=-1)
+        weight_sum = np.sum(gathered, axis=-1)
+        # Avoid division by zero; downstream we still threshold on max salience so degenerate frames get zeroed.
+        weight_sum = np.where(weight_sum == 0, 1.0, weight_sum)
+        devided = product_sum / weight_sum
+        # Threshold: any frame whose max salience is below `thred` is treated as unvoiced (cents = 0).
+        maxx = np.max(salience_np, axis=-1)
+        devided = np.where(maxx <= thred, 0.0, devided)
+        return devided
+
+    def decode(self, hidden: mx.array, thred: float = 0.03) -> np.ndarray:
+        """Convert a (..., T, 360) salience map to f0 in Hz; zero entries indicate unvoiced frames."""
+        cents_pred = self.to_local_average_cents(hidden, thred=thred)
+        f0 = 10 * (2 ** (cents_pred / 1200))
+        # Where cents_pred == 0 the formula gives f0 == 10. The reference uses this sentinel to mark unvoiced frames
+        # and zeroes them out.
+        f0 = np.where(f0 == 10, 0.0, f0)
+        return f0
+
+    def infer_from_audio(self, audio: mx.array, thred: float = 0.03) -> np.ndarray:
+        """
+        Full RMVPE inference: raw audio in -> per-frame f0 (Hz) out. `audio` should be shape (B, L) at 16 kHz.
+        Returns a NumPy array of shape (B, T) where T is the number of frames after STFT framing.
+        """
+        mel = self.mel_extractor(audio)
+        hidden = self.mel2hidden(mel)
+        return self.decode(hidden, thred=thred)
