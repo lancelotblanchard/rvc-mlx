@@ -10,7 +10,7 @@ from functools import partial
 
 import pytest
 import numpy as np
-from rvc_mlx.utils import narrow, pad_constant, sequence_mask
+from rvc_mlx.utils import narrow, pad_constant, pad_reflect_last_dim, sequence_mask
 import torch
 
 from .mlx_torch_comparison_framework import (
@@ -372,6 +372,113 @@ class TestUtilsPadConstant(BaseOperationTest):
             },
             description="Padding with integer input"
         )
+
+def _torch_pad_reflect_last_dim(input, pad_left, pad_right):
+    """
+    Reference using torch.nn.functional.pad with mode='reflect' on the last dimension only.
+    `torch.nn.functional.pad(..., mode='reflect')` requires the input to be 3D-5D when padding only the last dim, so we
+    reshape into 3D, pad, and reshape back to match the original number of leading dims.
+    """
+    if pad_left < 0 or pad_right < 0:
+        # Match the MLX implementation which raises before delegating to torch's underlying op.
+        raise ValueError("pad_left and pad_right must be non-negative")
+    orig_shape = input.shape
+    reshaped = input.reshape((1,) * (3 - input.ndim) + tuple(input.shape)) if input.ndim < 3 else input
+    padded = torch.nn.functional.pad(reshaped, (pad_left, pad_right), mode="reflect")
+    return padded.reshape(*orig_shape[:-1], padded.shape[-1])
+
+
+class TestUtilsPadReflectLastDim(BaseOperationTest):
+    @classmethod
+    def setup_class(cls):
+        cls.suite = OperationTestSuite(
+            pad_reflect_last_dim, _torch_pad_reflect_last_dim, "pad_reflect_last_dim"
+        )
+
+        cls.suite.add_test_case(
+            name="1d_symmetric",
+            inputs={
+                "input": np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+                "pad_left": 2,
+                "pad_right": 2,
+            },
+            description="1D reflect pad mirrors without repeating boundary",
+        )
+
+        cls.suite.add_test_case(
+            name="1d_asymmetric",
+            inputs={
+                "input": np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+                "pad_left": 1,
+                "pad_right": 3,
+            },
+            description="Asymmetric reflect pad",
+        )
+
+        cls.suite.add_test_case(
+            name="1d_left_only",
+            inputs={
+                "input": np.arange(8, dtype=np.float32),
+                "pad_left": 4,
+                "pad_right": 0,
+            },
+            description="Left-only reflect pad",
+        )
+
+        cls.suite.add_test_case(
+            name="1d_right_only",
+            inputs={
+                "input": np.arange(8, dtype=np.float32),
+                "pad_left": 0,
+                "pad_right": 4,
+            },
+            description="Right-only reflect pad",
+        )
+
+        cls.suite.add_test_case(
+            name="1d_no_pad",
+            inputs={
+                "input": np.arange(5, dtype=np.float32),
+                "pad_left": 0,
+                "pad_right": 0,
+            },
+            description="No padding returns input unchanged",
+        )
+
+        cls.suite.add_test_case(
+            name="audio_like",
+            inputs={
+                "input": np.random.default_rng(7).standard_normal((1, 1024)).astype(np.float32),
+                "pad_left": 256,
+                "pad_right": 256,
+            },
+            description="Audio-sized reflect pad matching torch.stft's center=True behavior",
+        )
+
+        cls.suite.add_test_case(
+            name="negative_pad_left",
+            inputs={
+                "input": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                "pad_left": -1,
+                "pad_right": 0,
+            },
+            should_error=True,
+            error_type=ValueError,
+            description="Negative pad_left must raise ValueError",
+        )
+
+        cls.suite.add_test_case(
+            name="pad_equals_size",
+            inputs={
+                "input": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                "pad_left": 3,
+                "pad_right": 0,
+            },
+            should_error=True,
+            error_type=ValueError,
+            description="Reflect padding requires pad < last-dim size",
+        )
+
 
 def _torch_sequence_mask(length, max_length=None):
     """Reference implementation matching the helper used in RVC."""

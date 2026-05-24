@@ -6,7 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from rvc_mlx.stft import stft
-from rvc_mlx.utils import pad_constant
+from rvc_mlx.utils import pad_constant, pad_reflect_last_dim
 from rvc_mlx.windows import hann
 
 
@@ -71,13 +71,22 @@ class MelSpectrogram:
         if keyshift_key not in self.hann_window:
             self.hann_window[keyshift_key] = hann(win_length_new, sym=False)
 
+        # `torch.stft` defaults to `pad_mode="reflect"` when `center=True`, and the RVC reference relies on that
+        # default. Our MLX `stft` only supports `pad_mode="constant"`, so we apply reflect padding ourselves and call
+        # `stft(..., center=False)` to suppress its internal padding.
+        if center:
+            pad_amount = n_fft_new // 2
+            audio_for_stft = pad_reflect_last_dim(audio, pad_amount, pad_amount)
+        else:
+            audio_for_stft = audio
+
         fft = stft(
-            audio,
+            audio_for_stft,
             n_fft=n_fft_new,
             hop_length=hop_length_new,
             win_length=win_length_new,
             window=self.hann_window[keyshift_key],
-            center=center,
+            center=False,
         )
         # Match torch.stft's default onesided=True for real input by slicing the full two-sided spectrum down to
         # n_fft // 2 + 1 frequency bins along the frequency axis (second-to-last).

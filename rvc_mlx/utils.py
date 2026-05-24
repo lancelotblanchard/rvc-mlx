@@ -113,6 +113,43 @@ def pad_constant(
     return out
 
 
+def pad_reflect_last_dim(input: mx.array, pad_left: int, pad_right: int) -> mx.array:
+    """
+    Reflect-pad the last dimension of `input` by `pad_left` on the left and `pad_right` on the right, mirroring values
+    around the boundary *without* repeating the boundary element. This matches PyTorch's default
+    `torch.nn.functional.pad(..., mode="reflect")` and `torch.stft(..., pad_mode="reflect")` behavior.
+
+    Example for a 1D tensor [a, b, c, d, e] with pad_left=2 and pad_right=2: the result is [c, b, a, b, c, d, e, d, c].
+
+    :param input: the tensor to pad. Must have at least 1 dimension.
+    :param pad_left: non-negative number of elements to prepend along the last axis. Must be < L (last-dim size).
+    :param pad_right: non-negative number of elements to append along the last axis. Must be < L.
+    :return: the padded tensor with shape identical to `input` except the last dim is L + pad_left + pad_right.
+    """
+    if pad_left < 0 or pad_right < 0:
+        raise ValueError(f"pad_left and pad_right must be non-negative, got ({pad_left}, {pad_right}).")
+    if pad_left == 0 and pad_right == 0:
+        return input
+
+    L = input.shape[-1]
+    if pad_left >= L or pad_right >= L:
+        raise ValueError(
+            f"Reflect padding requires pad < last-dim size ({L}); got pad_left={pad_left}, pad_right={pad_right}."
+        )
+
+    parts = []
+    if pad_left > 0:
+        # Mirror indices 1..pad_left in reverse: [pad_left, pad_left-1, ..., 1].
+        left_idx = mx.arange(pad_left, 0, -1)
+        parts.append(mx.take(input, left_idx, axis=-1))
+    parts.append(input)
+    if pad_right > 0:
+        # Mirror indices L-2, L-3, ..., L-1-pad_right.
+        right_idx = mx.arange(L - 2, L - 2 - pad_right, -1)
+        parts.append(mx.take(input, right_idx, axis=-1))
+    return mx.concatenate(parts, axis=-1)
+
+
 def sequence_mask(length: mx.array, max_length: Optional[int] = None) -> mx.array:
     """
     Construct a boolean mask of shape (B, max_length) from a (B,) tensor of lengths. The element at index (i, j) is True
