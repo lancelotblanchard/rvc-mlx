@@ -150,6 +150,71 @@ def pad_reflect_last_dim(input: mx.array, pad_left: int, pad_right: int) -> mx.a
     return mx.concatenate(parts, axis=-1)
 
 
+def interpolate_nearest_axis(x: mx.array, scale_factor: int, axis: int) -> mx.array:
+    """
+    1D nearest-neighbour upsampling along `axis`, matching
+    `torch.nn.functional.interpolate(scale_factor=int, mode="nearest")`.
+
+    For an integer scale factor, PyTorch's nearest mode maps output position `k` to input position `k // scale_factor`,
+    which is equivalent to repeating each input element `scale_factor` times. The output length along `axis` is
+    `input_length * scale_factor`.
+
+    :param x: input array.
+    :param scale_factor: positive integer multiplier for the size along `axis`.
+    :param axis: axis to upsample.
+    """
+    if scale_factor <= 0:
+        raise ValueError(f"scale_factor must be a positive integer, got {scale_factor}.")
+    if scale_factor == 1:
+        return x
+    return mx.repeat(x, repeats=scale_factor, axis=axis)
+
+
+def interpolate_linear_axis(x: mx.array, scale_factor: int, axis: int) -> mx.array:
+    """
+    1D linear interpolation along `axis` with `align_corners=True`, matching
+    `torch.nn.functional.interpolate(scale_factor=int, mode="linear", align_corners=True)`.
+
+    The output length along `axis` is `input_length * scale_factor`. With `align_corners=True`, the endpoints of the
+    input are exactly preserved at the endpoints of the output. Concretely, for each output position k in
+    `[0, N_out - 1]` the float input position is `k * (N_in - 1) / (N_out - 1)`; we linearly blend the floor/ceil
+    samples by the fractional part.
+
+    Used by RVC's `SineGen` to upsample the cumulative phase signal to audio rate.
+
+    :param x: input array with length N along `axis`. Must have N >= 2 (so the denominator `N_out - 1` is non-zero).
+    :param scale_factor: positive integer multiplier for the size along `axis`.
+    :param axis: axis to upsample.
+    """
+    if scale_factor <= 0:
+        raise ValueError(f"scale_factor must be a positive integer, got {scale_factor}.")
+    if scale_factor == 1:
+        return x
+    n_in = x.shape[axis]
+    if n_in < 2:
+        raise ValueError(
+            f"interpolate_linear_axis requires input length >= 2 along axis {axis}, got {n_in}."
+        )
+    n_out = n_in * scale_factor
+
+    # Float input positions for each of the n_out output samples.
+    pos = mx.arange(n_out, dtype=mx.float32) * ((n_in - 1) / (n_out - 1))
+    pos_low_i = mx.floor(pos).astype(mx.int32)
+    # Clamp pos_low + 1 to the last valid index so the rightmost output sample reads the same low/high pair.
+    pos_high_i = mx.minimum(pos_low_i + 1, n_in - 1)
+    frac = pos - pos_low_i.astype(mx.float32)
+
+    x_low = mx.take(x, pos_low_i, axis=axis)
+    x_high = mx.take(x, pos_high_i, axis=axis)
+
+    # Broadcast `frac` so it aligns with `axis` of x_low/x_high. Reshape to (1, ..., 1, n_out, 1, ..., 1).
+    shape = [1] * x.ndim
+    shape[axis] = n_out
+    frac = frac.reshape(shape).astype(x.dtype)
+
+    return x_low * (1 - frac) + x_high * frac
+
+
 def sequence_mask(length: mx.array, max_length: Optional[int] = None) -> mx.array:
     """
     Construct a boolean mask of shape (B, max_length) from a (B,) tensor of lengths. The element at index (i, j) is True

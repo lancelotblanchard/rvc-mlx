@@ -239,6 +239,232 @@ def to_channels_first(x: mx.array) -> mx.array:
     return mx.transpose(x, (0, 3, 1, 2))
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Synthesizer bridge helpers (transformer encoder building blocks).
+#
+# The synthesizer modules use 1D convolutions in channels-last MLX convention. The PyTorch references use Conv1d in
+# channels-first. Weight transposes for Conv1d follow the same pattern as Conv2d, except there's only one spatial
+# (kernel) axis.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def copy_conv1d(torch_conv: torch.nn.Conv1d, mlx_conv: nn.Conv1d) -> None:
+    """
+    PyTorch Conv1d weight shape: (out_channels, in_channels, kernel_size)
+    MLX     Conv1d weight shape: (out_channels, kernel_size, in_channels)  -- channels-last
+    """
+    w = torch_conv.weight.detach().cpu().numpy().transpose(0, 2, 1)
+    mlx_conv.weight = mx.array(w)
+    if torch_conv.bias is not None:
+        mlx_conv.bias = _to_mx(torch_conv.bias)
+
+
+def to_time_last(x: mx.array) -> mx.array:
+    """Convert a 3D channels-first tensor (B, C, T) to MLX channels-last (B, T, C)."""
+    return mx.transpose(x, (0, 2, 1))
+
+
+def to_time_first(x: mx.array) -> mx.array:
+    """Convert a 3D channels-last tensor (B, T, C) back to (B, C, T) for comparison with PyTorch."""
+    return mx.transpose(x, (0, 2, 1))
+
+
+def copy_layer_norm(torch_ln, mlx_ln) -> None:
+    """
+    RVC's `LayerNorm` parametrizes as `gamma`/`beta` (instead of PyTorch's `weight`/`bias` on `nn.LayerNorm`). Both our
+    MLX module and the torch ref follow that convention.
+    """
+    mlx_ln.gamma = _to_mx(torch_ln.gamma)
+    mlx_ln.beta = _to_mx(torch_ln.beta)
+
+
+def copy_ffn(torch_ffn, mlx_ffn) -> None:
+    copy_conv1d(torch_ffn.conv_1, mlx_ffn.conv_1)
+    copy_conv1d(torch_ffn.conv_2, mlx_ffn.conv_2)
+
+
+def copy_multi_head_attention(torch_mha, mlx_mha) -> None:
+    """
+    Copy all four 1x1 Conv1d projections plus, when present, the relative-position embedding tensors. The relative
+    embeddings have shape `(n_heads_rel, 2 * window_size + 1, k_channels)` in both frameworks (no transpose).
+    """
+    copy_conv1d(torch_mha.conv_q, mlx_mha.conv_q)
+    copy_conv1d(torch_mha.conv_k, mlx_mha.conv_k)
+    copy_conv1d(torch_mha.conv_v, mlx_mha.conv_v)
+    copy_conv1d(torch_mha.conv_o, mlx_mha.conv_o)
+    if getattr(torch_mha, "window_size", None) is not None:
+        mlx_mha.emb_rel_k = _to_mx(torch_mha.emb_rel_k)
+        mlx_mha.emb_rel_v = _to_mx(torch_mha.emb_rel_v)
+
+
+def copy_transformer_encoder(torch_enc, mlx_enc) -> None:
+    """Copy the stack of (MultiHeadAttention, LayerNorm, FFN, LayerNorm) blocks that make up RVC's text-encoder."""
+    for t_attn, m_attn in zip(torch_enc.attn_layers, mlx_enc.attn_layers):
+        copy_multi_head_attention(t_attn, m_attn)
+    for t_norm, m_norm in zip(torch_enc.norm_layers_1, mlx_enc.norm_layers_1):
+        copy_layer_norm(t_norm, m_norm)
+    for t_ffn, m_ffn in zip(torch_enc.ffn_layers, mlx_enc.ffn_layers):
+        copy_ffn(t_ffn, m_ffn)
+    for t_norm, m_norm in zip(torch_enc.norm_layers_2, mlx_enc.norm_layers_2):
+        copy_layer_norm(t_norm, m_norm)
+
+
+def copy_embedding(torch_emb: torch.nn.Embedding, mlx_emb: nn.Embedding) -> None:
+    """PyTorch and MLX Embedding share weight shape `(num_embeddings, embedding_dim)`."""
+    mlx_emb.weight = _to_mx(torch_emb.weight)
+
+
+def copy_text_encoder_768(torch_te, mlx_te) -> None:
+    """Copy the full TextEncoder768 (phone Linear + pitch Embedding + transformer Encoder + 1x1 projection)."""
+    copy_linear(torch_te.emb_phone, mlx_te.emb_phone)
+    copy_embedding(torch_te.emb_pitch, mlx_te.emb_pitch)
+    copy_transformer_encoder(torch_te.encoder, mlx_te.encoder)
+    copy_conv1d(torch_te.proj, mlx_te.proj)
+
+
+def copy_source_module_hn_nsf(torch_sm, mlx_sm) -> None:
+    """`SineGen` has no learnable parameters, so only the merge Linear needs copying."""
+    copy_linear(torch_sm.l_linear, mlx_sm.l_linear)
+
+
+def copy_conv_transpose1d(torch_conv, mlx_conv) -> None:
+    """
+    PyTorch ConvTranspose1d weight shape: `(in_channels, out_channels // groups, kernel_size)`
+    MLX     ConvTranspose1d weight shape: `(out_channels, kernel_size, in_channels // groups)`
+    """
+    w = torch_conv.weight.detach().cpu().numpy().transpose(1, 2, 0)
+    mlx_conv.weight = mx.array(w)
+    if torch_conv.bias is not None:
+        mlx_conv.bias = _to_mx(torch_conv.bias)
+
+
+def copy_res_block1(torch_rb, mlx_rb) -> None:
+    """Copy a `ResBlock1`: two parallel stacks of three Conv1d each."""
+    for tc, mc in zip(torch_rb.convs1, mlx_rb.convs1):
+        copy_conv1d(tc, mc)
+    for tc, mc in zip(torch_rb.convs2, mlx_rb.convs2):
+        copy_conv1d(tc, mc)
+
+
+def copy_wn(torch_wn, mlx_wn) -> None:
+    """Copy `WN`: parallel stacks of input dilated convs + residual-skip 1x1 convs, plus the optional cond Conv1d."""
+    for t_in, m_in in zip(torch_wn.in_layers, mlx_wn.in_layers):
+        copy_conv1d(t_in, m_in)
+    for t_rs, m_rs in zip(torch_wn.res_skip_layers, mlx_wn.res_skip_layers):
+        copy_conv1d(t_rs, m_rs)
+    if torch_wn.gin_channels != 0:
+        copy_conv1d(torch_wn.cond_layer, mlx_wn.cond_layer)
+
+
+def copy_residual_coupling_layer(torch_rcl, mlx_rcl) -> None:
+    """Copy `ResidualCouplingLayer`: pre Conv1d + WN parameter network + post Conv1d."""
+    copy_conv1d(torch_rcl.pre, mlx_rcl.pre)
+    copy_wn(torch_rcl.enc, mlx_rcl.enc)
+    copy_conv1d(torch_rcl.post, mlx_rcl.post)
+
+
+def copy_residual_coupling_block(torch_rcb, mlx_rcb) -> None:
+    """Copy `ResidualCouplingBlock`: alternating `ResidualCouplingLayer` + `Flip`s (Flip has no params)."""
+    for t_flow, m_flow in zip(torch_rcb.flows, mlx_rcb.flows):
+        # Even indices are coupling layers (with weights); odd indices are Flip (parameter-free).
+        if hasattr(t_flow, "pre"):
+            copy_residual_coupling_layer(t_flow, m_flow)
+
+
+def copy_generator_nsf(torch_gen, mlx_gen) -> None:
+    """
+    Copy `GeneratorNSF`: source module + pre Conv + upsampling ConvTranspose + noise Conv + ResBlock stacks + post Conv
+    + optional speaker conditioning Conv.
+    """
+    copy_source_module_hn_nsf(torch_gen.m_source, mlx_gen.m_source)
+    copy_conv1d(torch_gen.conv_pre, mlx_gen.conv_pre)
+    for t_up, m_up in zip(torch_gen.ups, mlx_gen.ups):
+        copy_conv_transpose1d(t_up, m_up)
+    for t_nc, m_nc in zip(torch_gen.noise_convs, mlx_gen.noise_convs):
+        copy_conv1d(t_nc, m_nc)
+    for t_rb, m_rb in zip(torch_gen.resblocks, mlx_gen.resblocks):
+        copy_res_block1(t_rb, m_rb)
+    copy_conv1d(torch_gen.conv_post, mlx_gen.conv_post)
+    if torch_gen.gin_channels != 0:
+        copy_conv1d(torch_gen.cond, mlx_gen.cond)
+
+
+def copy_synthesizer_trn_ms768_nsfsid(torch_syn, mlx_syn) -> None:
+    """Copy the full inference synthesizer (TextEncoder768 + GeneratorNSF + ResidualCouplingBlock + speaker Embedding)."""
+    copy_text_encoder_768(torch_syn.enc_p, mlx_syn.enc_p)
+    copy_generator_nsf(torch_syn.dec, mlx_syn.dec)
+    copy_residual_coupling_block(torch_syn.flow, mlx_syn.flow)
+    copy_embedding(torch_syn.emb_g, mlx_syn.emb_g)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# HuBERT bridge helpers.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def copy_layer_norm_pytorch_style(torch_ln: torch.nn.LayerNorm, mlx_ln: nn.LayerNorm) -> None:
+    """Copy a `torch.nn.LayerNorm` to `mlx.nn.LayerNorm` (both store `weight` and `bias` of shape `(dim,)`)."""
+    mlx_ln.weight = _to_mx(torch_ln.weight)
+    if torch_ln.bias is not None:
+        mlx_ln.bias = _to_mx(torch_ln.bias)
+
+
+def copy_group_norm(torch_gn: torch.nn.GroupNorm, mlx_gn: nn.GroupNorm) -> None:
+    """PyTorch and MLX GroupNorm share `weight` and `bias` parameter shapes `(num_channels,)`."""
+    if torch_gn.affine:
+        mlx_gn.weight = _to_mx(torch_gn.weight)
+        mlx_gn.bias = _to_mx(torch_gn.bias)
+
+
+def copy_feature_extractor(torch_fe, mlx_fe) -> None:
+    """Copy `FeatureExtractor`: 7 Conv1d + optional GroupNorm at layer 0."""
+    for t_conv, m_conv in zip(torch_fe.convs, mlx_fe.convs):
+        copy_conv1d(t_conv, m_conv)
+    for t_norm, m_norm in zip(torch_fe.norms, mlx_fe.norms):
+        if isinstance(t_norm, torch.nn.GroupNorm) and m_norm is not None:
+            copy_group_norm(t_norm, m_norm)
+
+
+def copy_hubert_multi_head_attention(torch_mha, mlx_mha) -> None:
+    """Copy the four Linear projections (q, k, v, out) of a HuBERT-style self-attention layer."""
+    copy_linear(torch_mha.q_proj, mlx_mha.q_proj)
+    copy_linear(torch_mha.k_proj, mlx_mha.k_proj)
+    copy_linear(torch_mha.v_proj, mlx_mha.v_proj)
+    copy_linear(torch_mha.out_proj, mlx_mha.out_proj)
+
+
+def copy_transformer_sentence_encoder_layer(torch_layer, mlx_layer) -> None:
+    """Copy a single pre-norm transformer block."""
+    copy_hubert_multi_head_attention(torch_layer.self_attn, mlx_layer.self_attn)
+    copy_layer_norm_pytorch_style(torch_layer.self_attn_layer_norm, mlx_layer.self_attn_layer_norm)
+    copy_linear(torch_layer.fc1, mlx_layer.fc1)
+    copy_linear(torch_layer.fc2, mlx_layer.fc2)
+    copy_layer_norm_pytorch_style(torch_layer.final_layer_norm, mlx_layer.final_layer_norm)
+
+
+def copy_positional_conv(torch_pc, mlx_pc) -> None:
+    """`PositionalConv` is just a grouped Conv1d; weight_norm is already fused before the copy is called."""
+    copy_conv1d(torch_pc.conv, mlx_pc.conv)
+
+
+def copy_hubert_transformer_encoder(torch_enc, mlx_enc) -> None:
+    """Copy the HuBERT transformer encoder (pos_conv + layer_norm + N transformer blocks)."""
+    copy_positional_conv(torch_enc.pos_conv, mlx_enc.pos_conv)
+    copy_layer_norm_pytorch_style(torch_enc.layer_norm, mlx_enc.layer_norm)
+    for t_layer, m_layer in zip(torch_enc.layers, mlx_enc.layers):
+        copy_transformer_sentence_encoder_layer(t_layer, m_layer)
+
+
+def copy_hubert_model(torch_hm, mlx_hm) -> None:
+    """Copy a full `HubertModel` (feature extractor + LayerNorm + post-extract projection + encoder + optional final_proj)."""
+    copy_feature_extractor(torch_hm.feature_extractor, mlx_hm.feature_extractor)
+    copy_layer_norm_pytorch_style(torch_hm.layer_norm, mlx_hm.layer_norm)
+    copy_linear(torch_hm.post_extract_proj, mlx_hm.post_extract_proj)
+    copy_hubert_transformer_encoder(torch_hm.encoder, mlx_hm.encoder)
+    if torch_hm.has_final_proj:
+        copy_linear(torch_hm.final_proj, mlx_hm.final_proj)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:

@@ -1,15 +1,31 @@
 name: Tests
 
+# Triggers:
+#   * push to main / develop    -> CI on the protected branches after merge
+#   * push to claude/**         -> CI on Claude Code feature branches without needing an open PR
+#   * pull_request to main      -> CI on PRs targeting main (the standard PR check)
+#   * workflow_dispatch         -> manual re-run from the Actions tab
 on:
   push:
-    branches: [ main, develop ]
+    branches:
+      - main
+      - develop
+      - 'claude/**'
   pull_request:
     branches: [ main, develop ]
   workflow_dispatch:
 
+# Cancel in-progress runs for the same ref when a new commit comes in. Saves macOS minutes during iterative pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: [macos-latest]
+    # macos-latest is on Apple Silicon, which is required for MLX. Pinning to `macos-latest` keeps us on the GitHub
+    # default; revisit if we ever need a specific macOS version (e.g. macos-14 vs macos-15).
+    runs-on: macos-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
 
@@ -19,8 +35,9 @@ jobs:
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
-        python-version: 3.12
+        python-version: '3.12'
         cache: 'pip'
+        cache-dependency-path: pyproject.toml
 
     - name: Install dependencies
       run: |
