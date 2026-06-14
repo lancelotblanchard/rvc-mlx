@@ -397,6 +397,74 @@ def copy_synthesizer_trn_ms768_nsfsid(torch_syn, mlx_syn) -> None:
     copy_embedding(torch_syn.emb_g, mlx_syn.emb_g)
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# HuBERT bridge helpers.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def copy_layer_norm_pytorch_style(torch_ln: torch.nn.LayerNorm, mlx_ln: nn.LayerNorm) -> None:
+    """Copy a `torch.nn.LayerNorm` to `mlx.nn.LayerNorm` (both store `weight` and `bias` of shape `(dim,)`)."""
+    mlx_ln.weight = _to_mx(torch_ln.weight)
+    if torch_ln.bias is not None:
+        mlx_ln.bias = _to_mx(torch_ln.bias)
+
+
+def copy_group_norm(torch_gn: torch.nn.GroupNorm, mlx_gn: nn.GroupNorm) -> None:
+    """PyTorch and MLX GroupNorm share `weight` and `bias` parameter shapes `(num_channels,)`."""
+    if torch_gn.affine:
+        mlx_gn.weight = _to_mx(torch_gn.weight)
+        mlx_gn.bias = _to_mx(torch_gn.bias)
+
+
+def copy_feature_extractor(torch_fe, mlx_fe) -> None:
+    """Copy `FeatureExtractor`: 7 Conv1d + optional GroupNorm at layer 0."""
+    for t_conv, m_conv in zip(torch_fe.convs, mlx_fe.convs):
+        copy_conv1d(t_conv, m_conv)
+    for t_norm, m_norm in zip(torch_fe.norms, mlx_fe.norms):
+        if isinstance(t_norm, torch.nn.GroupNorm) and m_norm is not None:
+            copy_group_norm(t_norm, m_norm)
+
+
+def copy_hubert_multi_head_attention(torch_mha, mlx_mha) -> None:
+    """Copy the four Linear projections (q, k, v, out) of a HuBERT-style self-attention layer."""
+    copy_linear(torch_mha.q_proj, mlx_mha.q_proj)
+    copy_linear(torch_mha.k_proj, mlx_mha.k_proj)
+    copy_linear(torch_mha.v_proj, mlx_mha.v_proj)
+    copy_linear(torch_mha.out_proj, mlx_mha.out_proj)
+
+
+def copy_transformer_sentence_encoder_layer(torch_layer, mlx_layer) -> None:
+    """Copy a single pre-norm transformer block."""
+    copy_hubert_multi_head_attention(torch_layer.self_attn, mlx_layer.self_attn)
+    copy_layer_norm_pytorch_style(torch_layer.self_attn_layer_norm, mlx_layer.self_attn_layer_norm)
+    copy_linear(torch_layer.fc1, mlx_layer.fc1)
+    copy_linear(torch_layer.fc2, mlx_layer.fc2)
+    copy_layer_norm_pytorch_style(torch_layer.final_layer_norm, mlx_layer.final_layer_norm)
+
+
+def copy_positional_conv(torch_pc, mlx_pc) -> None:
+    """`PositionalConv` is just a grouped Conv1d; weight_norm is already fused before the copy is called."""
+    copy_conv1d(torch_pc.conv, mlx_pc.conv)
+
+
+def copy_hubert_transformer_encoder(torch_enc, mlx_enc) -> None:
+    """Copy the HuBERT transformer encoder (pos_conv + layer_norm + N transformer blocks)."""
+    copy_positional_conv(torch_enc.pos_conv, mlx_enc.pos_conv)
+    copy_layer_norm_pytorch_style(torch_enc.layer_norm, mlx_enc.layer_norm)
+    for t_layer, m_layer in zip(torch_enc.layers, mlx_enc.layers):
+        copy_transformer_sentence_encoder_layer(t_layer, m_layer)
+
+
+def copy_hubert_model(torch_hm, mlx_hm) -> None:
+    """Copy a full `HubertModel` (feature extractor + LayerNorm + post-extract projection + encoder + optional final_proj)."""
+    copy_feature_extractor(torch_hm.feature_extractor, mlx_hm.feature_extractor)
+    copy_layer_norm_pytorch_style(torch_hm.layer_norm, mlx_hm.layer_norm)
+    copy_linear(torch_hm.post_extract_proj, mlx_hm.post_extract_proj)
+    copy_hubert_transformer_encoder(torch_hm.encoder, mlx_hm.encoder)
+    if torch_hm.has_final_proj:
+        copy_linear(torch_hm.final_proj, mlx_hm.final_proj)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:

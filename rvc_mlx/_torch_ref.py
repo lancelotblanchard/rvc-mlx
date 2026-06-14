@@ -1176,3 +1176,231 @@ class TorchSynthesizerTrnMs768NSFsid(torch.nn.Module):
             nsff0 = nsff0[:, :max_len]
         o = self.dec(z_masked, nsff0, g=g, rand_ini=rand_ini, noise_raw=noise_raw)
         return o, x_mask, (z, z_p, m_p, logs_p)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# HuBERT / ContentVec PyTorch references.
+#
+# Inference-only port: no masking, no label_embs, no final_proj (toggled on via `has_final_proj=True` for v1
+# checkpoints). Module names match fairseq so the converter can map state_dict keys mechanically.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class TorchSamePad(torch.nn.Module):
+    """Crop the last axis by one if the kernel size is even, so a Conv1d with `padding=k//2` is "same"-length."""
+
+    def __init__(self, kernel_size):
+        super().__init__()
+        self.crop_one = kernel_size % 2 == 0
+
+    def forward(self, x):
+        # x: (B, C, T). PyTorch channels-first: time is the last axis.
+        if self.crop_one:
+            return x[..., :-1]
+        return x
+
+
+class TorchFeatureExtractor(torch.nn.Module):
+    """PyTorch reference for the convolutional feature extractor (`mode='default'` only)."""
+
+    def __init__(self, conv_layers, mode="default", conv_bias=False):
+        super().__init__()
+        if mode != "default":
+            raise NotImplementedError(mode)
+        self.conv_layers_config = tuple(conv_layers)
+        self.convs = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
+        # Pad `norms` with `Identity` modules where there's no normalization so `len(norms) == len(convs)` and the
+        # state_dict has a consistent shape (the released checkpoint won't have norm params for these slots; this
+        # makes their absence unambiguous).
+        in_d = 1
+        for i, (out_d, k, s) in enumerate(self.conv_layers_config):
+            self.convs.append(torch.nn.Conv1d(in_d, out_d, kernel_size=k, stride=s, bias=conv_bias))
+            if i == 0:
+                self.norms.append(torch.nn.GroupNorm(num_groups=out_d, num_channels=out_d, affine=True))
+            else:
+                self.norms.append(torch.nn.Identity())
+            in_d = out_d
+
+    def forward(self, audio):
+        # audio: (B, T_audio) -> (B, 1, T_audio).
+        x = audio.unsqueeze(1)
+        for conv, norm in zip(self.convs, self.norms):
+            x = conv(x)
+            x = norm(x)
+            x = torch.nn.functional.gelu(x)
+        return x  # (B, 512, T_out)
+
+
+class TorchHubertMultiHeadAttention(torch.nn.Module):
+    """Self-attention matching fairseq's `MultiheadAttention` for the `batch_first=True` self-attention case."""
+
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scaling = self.head_dim**-0.5
+        self.q_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.k_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.v_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.out_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x, key_padding_mask=None):
+        B, T, _ = x.shape
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(q * self.scaling, k.transpose(-2, -1))
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(1)
+            scores = scores.masked_fill(mask, -1e9)
+        attn = torch.nn.functional.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(B, T, self.embed_dim)
+        return self.out_proj(out)
+
+
+class TorchTransformerSentenceEncoderLayer(torch.nn.Module):
+    """Pre-norm transformer block with GELU activation, matching fairseq HuBERT's encoder layers."""
+
+    def __init__(self, embed_dim, ffn_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.self_attn = TorchHubertMultiHeadAttention(embed_dim, num_heads, dropout=dropout)
+        self.self_attn_layer_norm = torch.nn.LayerNorm(embed_dim)
+        self.fc1 = torch.nn.Linear(embed_dim, ffn_dim)
+        self.fc2 = torch.nn.Linear(ffn_dim, embed_dim)
+        self.final_layer_norm = torch.nn.LayerNorm(embed_dim)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        self.dropout2 = torch.nn.Dropout(dropout)
+        self.dropout3 = torch.nn.Dropout(dropout)
+
+    def forward(self, x, key_padding_mask=None):
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x = self.self_attn(x, key_padding_mask=key_padding_mask)
+        x = self.dropout1(x)
+        x = residual + x
+
+        residual = x
+        x = self.final_layer_norm(x)
+        x = torch.nn.functional.gelu(self.fc1(x))
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        x = self.dropout3(x)
+        x = residual + x
+        return x
+
+
+class TorchPositionalConv(torch.nn.Module):
+    def __init__(self, embed_dim, kernel_size=128, groups=16):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.groups = groups
+        self.conv = torch.nn.Conv1d(
+            embed_dim,
+            embed_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=groups,
+        )
+        self.same_pad = TorchSamePad(kernel_size)
+
+    def forward(self, x):
+        # x: (B, T, embed_dim) -> transpose to (B, embed_dim, T) for Conv1d.
+        x_cf = x.transpose(1, 2)
+        out = self.conv(x_cf)
+        out = self.same_pad(out)
+        out = torch.nn.functional.gelu(out)
+        return out.transpose(1, 2)  # back to (B, T, embed_dim)
+
+
+class TorchHubertTransformerEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        ffn_dim,
+        num_layers,
+        num_heads,
+        pos_conv_kernel=128,
+        pos_conv_groups=16,
+        dropout=0.0,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.pos_conv = TorchPositionalConv(embed_dim, pos_conv_kernel, pos_conv_groups)
+        self.layer_norm = torch.nn.LayerNorm(embed_dim)
+        self.layers = torch.nn.ModuleList(
+            [
+                TorchTransformerSentenceEncoderLayer(embed_dim, ffn_dim, num_heads, dropout=dropout)
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, x, padding_mask=None, output_layer=None):
+        x_pos = self.pos_conv(x)
+        x = x + x_pos
+        x = self.layer_norm(x)
+        layer_results = []
+        for i, layer in enumerate(self.layers):
+            x = layer(x, key_padding_mask=padding_mask)
+            layer_results.append(x)
+            if output_layer is not None and (i + 1) >= output_layer:
+                break
+        return x, layer_results
+
+
+class TorchHubertModel(torch.nn.Module):
+    """PyTorch reference for the HuBERT / ContentVec content encoder."""
+
+    def __init__(
+        self,
+        conv_layers,
+        extractor_mode="default",
+        embed_dim=768,
+        encoder_ffn_dim=3072,
+        encoder_layers=12,
+        encoder_attention_heads=12,
+        pos_conv_kernel=128,
+        pos_conv_groups=16,
+        has_final_proj=False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.has_final_proj = has_final_proj
+        self.feature_extractor = TorchFeatureExtractor(conv_layers, mode=extractor_mode)
+        feature_dim = conv_layers[-1][0]
+        self.layer_norm = torch.nn.LayerNorm(feature_dim)
+        self.post_extract_proj = torch.nn.Linear(feature_dim, embed_dim)
+        self.encoder = TorchHubertTransformerEncoder(
+            embed_dim=embed_dim,
+            ffn_dim=encoder_ffn_dim,
+            num_layers=encoder_layers,
+            num_heads=encoder_attention_heads,
+            pos_conv_kernel=pos_conv_kernel,
+            pos_conv_groups=pos_conv_groups,
+        )
+        if has_final_proj:
+            self.final_proj = torch.nn.Linear(embed_dim, embed_dim)
+        else:
+            self.final_proj = None
+
+    def extract_features(self, audio, padding_mask=None, output_layer=None):
+        x = self.feature_extractor(audio)  # (B, 512, T_out)
+        # LayerNorm is over the feature dim; transpose to (B, T_out, 512) so the last axis is the feature dim.
+        x = x.transpose(1, 2)
+        x = self.layer_norm(x)
+        x = self.post_extract_proj(x)
+        x, layer_results = self.encoder(x, padding_mask=padding_mask, output_layer=output_layer)
+        if output_layer is None or output_layer == self.encoder.num_layers:
+            out = x
+        else:
+            out = layer_results[output_layer - 1]
+        if self.has_final_proj and self.final_proj is not None:
+            out = self.final_proj(out)
+        return out
