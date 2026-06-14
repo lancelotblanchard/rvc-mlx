@@ -10,7 +10,14 @@ from functools import partial
 
 import pytest
 import numpy as np
-from rvc_mlx.utils import narrow, pad_constant, pad_reflect_last_dim, sequence_mask
+from rvc_mlx.utils import (
+    interpolate_linear_axis,
+    interpolate_nearest_axis,
+    narrow,
+    pad_constant,
+    pad_reflect_last_dim,
+    sequence_mask,
+)
 import torch
 
 from .mlx_torch_comparison_framework import (
@@ -527,6 +534,101 @@ class TestUtilsSequenceMask(BaseOperationTest):
             name="sequence_mask_large",
             inputs={"length": np.array([100, 50, 75, 128], dtype=np.int64), "max_length": 128},
             description="Sequence mask with larger lengths and int64 dtype",
+        )
+
+
+def _torch_interp_nearest(x, scale_factor, axis):
+    """
+    Reference adapter: PyTorch's `F.interpolate(mode='nearest')` expects (B, C, *) and operates on trailing dims, so we
+    swap our `axis` to the last dim, interpolate, and swap back.
+    """
+    x_t = x.transpose(axis, -1)
+    # `interpolate` requires at least 3D for "nearest" along the last dim (treats first two as N, C). Reshape so axis
+    # becomes the spatial dim with a single channel.
+    leading = x_t.shape[:-1]
+    n_in = x_t.shape[-1]
+    flat = x_t.reshape(-1, 1, n_in)
+    out = torch.nn.functional.interpolate(flat, scale_factor=float(scale_factor), mode="nearest")
+    out = out.reshape(*leading, n_in * scale_factor)
+    return out.transpose(axis, -1)
+
+
+def _torch_interp_linear(x, scale_factor, axis):
+    """Reference adapter for `mode='linear', align_corners=True`."""
+    x_t = x.transpose(axis, -1)
+    leading = x_t.shape[:-1]
+    n_in = x_t.shape[-1]
+    flat = x_t.reshape(-1, 1, n_in)
+    out = torch.nn.functional.interpolate(
+        flat, scale_factor=float(scale_factor), mode="linear", align_corners=True
+    )
+    out = out.reshape(*leading, n_in * scale_factor)
+    return out.transpose(axis, -1)
+
+
+class TestUtilsInterpolateNearest(BaseOperationTest):
+    @classmethod
+    def setup_class(cls):
+        cls.suite = OperationTestSuite(
+            interpolate_nearest_axis, _torch_interp_nearest, "interpolate_nearest_axis"
+        )
+
+        rng = np.random.default_rng(0)
+        cls.suite.add_test_case(
+            name="nearest_1d_last_axis",
+            inputs={"x": rng.standard_normal((4, 5)).astype(np.float32), "scale_factor": 3, "axis": -1},
+            description="2D input, upsample last axis 5 -> 15 by repeating each sample 3x",
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        cls.suite.add_test_case(
+            name="nearest_3d_middle_axis",
+            inputs={"x": rng.standard_normal((2, 8, 4)).astype(np.float32), "scale_factor": 4, "axis": 1},
+            description="(B, T, C) shape, upsample T 8 -> 32 (matches SineGen usage pattern)",
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        cls.suite.add_test_case(
+            name="nearest_scale_1_noop",
+            inputs={"x": rng.standard_normal((3, 6)).astype(np.float32), "scale_factor": 1, "axis": -1},
+            description="scale_factor=1 returns the input unchanged",
+            atol=0.0,
+            rtol=0.0,
+        )
+
+
+class TestUtilsInterpolateLinear(BaseOperationTest):
+    @classmethod
+    def setup_class(cls):
+        cls.suite = OperationTestSuite(
+            interpolate_linear_axis, _torch_interp_linear, "interpolate_linear_axis"
+        )
+
+        rng = np.random.default_rng(1)
+        cls.suite.add_test_case(
+            name="linear_1d_last_axis",
+            inputs={"x": rng.standard_normal((4, 5)).astype(np.float32), "scale_factor": 3, "axis": -1},
+            description="2D input, linear upsample 5 -> 15 with align_corners=True",
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        cls.suite.add_test_case(
+            name="linear_3d_middle_axis",
+            inputs={"x": rng.standard_normal((2, 8, 4)).astype(np.float32), "scale_factor": 4, "axis": 1},
+            description="(B, T, C) shape, linear upsample T 8 -> 32 (matches SineGen usage)",
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        cls.suite.add_test_case(
+            name="linear_scale_2_endpoints",
+            inputs={
+                "x": np.array([[0.0, 1.0, 2.0]], dtype=np.float32),
+                "scale_factor": 2,
+                "axis": -1,
+            },
+            description="Verifies align_corners=True: endpoints match exactly",
+            atol=1e-6,
+            rtol=1e-6,
         )
 
 

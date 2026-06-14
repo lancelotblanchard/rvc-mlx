@@ -18,12 +18,16 @@ from rvc_mlx.synthesizer import (
     FFN,
     LayerNorm,
     MultiHeadAttention,
+    SineGen,
+    SourceModuleHnNSF,
     TextEncoder768,
 )
 from rvc_mlx._torch_ref import (
     TorchFFN,
     TorchLayerNorm,
     TorchMultiHeadAttention,
+    TorchSineGen,
+    TorchSourceModuleHnNSF,
     TorchTextEncoder768,
     TorchTransformerEncoder,
 )
@@ -33,6 +37,7 @@ from .torch_bridge import (
     copy_ffn,
     copy_layer_norm,
     copy_multi_head_attention,
+    copy_source_module_hn_nsf,
     copy_text_encoder_768,
     copy_transformer_encoder,
     set_eval,
@@ -536,6 +541,199 @@ class TestSynthesizerTextEncoder768Mask(BaseOperationTest):
             description="x_mask derived from per-batch lengths; verifies sequence_mask shape and dtype",
             atol=1e-6,
             rtol=1e-6,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# NSF source modules (SineGen, SourceModuleHnNSF).
+#
+# Both modules sample random tensors internally in the original reference. Our refactored versions accept `rand_ini`
+# (per-harmonic initial-phase noise) and `noise_raw` (unit-variance Gaussian noise) as optional kwargs so paired-module
+# tests can feed the same tensors to both impls.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _sine_gen_inputs(batch, length, upp, dim, rng):
+    """Generate (f0, rand_ini, noise_raw) test inputs."""
+    # Mix voiced (f0 > 0) and unvoiced (f0 == 0) regions to exercise both branches of _f02uv.
+    f0 = rng.uniform(50.0, 500.0, size=(batch, length)).astype(np.float32)
+    # Force the last few frames per batch to be unvoiced.
+    f0[:, -4:] = 0.0
+    rand_ini = rng.uniform(size=(batch, dim)).astype(np.float32)
+    noise_raw = rng.standard_normal((batch, length * upp, dim)).astype(np.float32)
+    return f0, rand_ini, noise_raw
+
+
+def _build_sine_gen_pair(harmonic_num=0, sine_amp=0.1, noise_std=0.003, voiced_threshold=0.0):
+    init = dict(
+        samp_rate=16000,
+        harmonic_num=harmonic_num,
+        sine_amp=sine_amp,
+        noise_std=noise_std,
+        voiced_threshold=voiced_threshold,
+    )
+    t_sg = TorchSineGen(**init)
+    m_sg = SineGen(**init)
+    set_eval(t_sg, m_sg)
+    return t_sg, m_sg
+
+
+class TestSynthesizerSineGenFundamentalOnly(BaseOperationTest):
+    """SineGen with harmonic_num=0 (RVC default): just the fundamental sine plus noise."""
+
+    @classmethod
+    def setup_class(cls):
+        t_sg, m_sg = _build_sine_gen_pair(harmonic_num=0)
+
+        def mlx_fn(f0, upp, rand_ini, noise_raw):
+            sine, _, _ = m_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return sine
+
+        def torch_fn(f0, upp, rand_ini, noise_raw):
+            with torch.no_grad():
+                sine, _, _ = t_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return sine
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "sine_gen_fund")
+
+        rng = np.random.default_rng(0)
+        f0, rand_ini, noise_raw = _sine_gen_inputs(batch=1, length=16, upp=4, dim=1, rng=rng)
+        cls.suite.add_test_case(
+            name="sine_gen_fund_upp4",
+            inputs={"f0": f0, "upp": 4, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="Fundamental-only SineGen, upp=4, mixed voiced/unvoiced frames",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerSineGenHarmonics(BaseOperationTest):
+    """SineGen with harmonic_num=2 to exercise the multi-channel harmonic-multiplier path."""
+
+    @classmethod
+    def setup_class(cls):
+        t_sg, m_sg = _build_sine_gen_pair(harmonic_num=2)
+
+        def mlx_fn(f0, upp, rand_ini, noise_raw):
+            sine, _, _ = m_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return sine
+
+        def torch_fn(f0, upp, rand_ini, noise_raw):
+            with torch.no_grad():
+                sine, _, _ = t_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return sine
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "sine_gen_harm2")
+
+        rng = np.random.default_rng(1)
+        f0, rand_ini, noise_raw = _sine_gen_inputs(batch=2, length=12, upp=4, dim=3, rng=rng)
+        cls.suite.add_test_case(
+            name="sine_gen_harm2_upp4",
+            inputs={"f0": f0, "upp": 4, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="SineGen with 2 harmonics (dim=3 total channels), upp=4",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerSineGenUV(BaseOperationTest):
+    """Voiced/unvoiced output of SineGen. Doesn't depend on noise; should match exactly."""
+
+    @classmethod
+    def setup_class(cls):
+        t_sg, m_sg = _build_sine_gen_pair(harmonic_num=0, voiced_threshold=10.0)
+
+        def mlx_fn(f0, upp, rand_ini, noise_raw):
+            _, uv, _ = m_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return uv
+
+        def torch_fn(f0, upp, rand_ini, noise_raw):
+            with torch.no_grad():
+                _, uv, _ = t_sg(f0, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+            return uv
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "sine_gen_uv")
+
+        rng = np.random.default_rng(2)
+        f0, rand_ini, noise_raw = _sine_gen_inputs(batch=1, length=16, upp=4, dim=1, rng=rng)
+        # Tighten f0 so some frames are below the 10 Hz threshold and others above.
+        f0[0, ::3] = 5.0  # every third frame is below threshold -> unvoiced
+        cls.suite.add_test_case(
+            name="sine_gen_uv_threshold",
+            inputs={"f0": f0, "upp": 4, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="voiced_threshold=10 with mixed below/above-threshold frames",
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# SourceModuleHnNSF wraps SineGen with a Linear + tanh that mixes harmonics down to a single channel.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _build_source_module_pair(harmonic_num=0, seed=0):
+    torch.manual_seed(seed)
+    init = dict(
+        sampling_rate=16000,
+        harmonic_num=harmonic_num,
+        sine_amp=0.1,
+        add_noise_std=0.003,
+        voiced_threshold=0.0,
+        is_half=False,
+    )
+    t_sm = TorchSourceModuleHnNSF(**init)
+    m_sm = SourceModuleHnNSF(**init)
+    copy_source_module_hn_nsf(t_sm, m_sm)
+    set_eval(t_sm, m_sm)
+
+    def mlx_fn(x, upp, rand_ini, noise_raw):
+        sine_merge, _, _ = m_sm(x, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        return sine_merge
+
+    def torch_fn(x, upp, rand_ini, noise_raw):
+        with torch.no_grad():
+            sine_merge, _, _ = t_sm(x, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        return sine_merge
+
+    return mlx_fn, torch_fn
+
+
+class TestSynthesizerSourceModuleFund(BaseOperationTest):
+    """SourceModuleHnNSF with harmonic_num=0 (RVC default for the inference NSF generator)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_source_module_pair(harmonic_num=0)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "source_module_fund")
+
+        rng = np.random.default_rng(0)
+        f0, rand_ini, noise_raw = _sine_gen_inputs(batch=1, length=16, upp=4, dim=1, rng=rng)
+        cls.suite.add_test_case(
+            name="source_module_fund_upp4",
+            inputs={"x": f0, "upp": 4, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="Fundamental-only source module, upp=4, mixed voicing",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerSourceModuleHarmonics(BaseOperationTest):
+    """SourceModuleHnNSF with harmonic_num=2 to exercise the multi-harmonic Linear projection."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_source_module_pair(harmonic_num=2, seed=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "source_module_harm2")
+
+        rng = np.random.default_rng(1)
+        f0, rand_ini, noise_raw = _sine_gen_inputs(batch=2, length=12, upp=4, dim=3, rng=rng)
+        cls.suite.add_test_case(
+            name="source_module_harm2_upp4",
+            inputs={"x": f0, "upp": 4, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="Source module with 2 harmonics (dim=3 -> Linear projects to 1 channel)",
+            atol=1e-4,
+            rtol=1e-4,
         )
 
 

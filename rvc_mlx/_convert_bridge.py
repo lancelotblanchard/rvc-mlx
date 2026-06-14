@@ -322,6 +322,11 @@ def copy_text_encoder_768(torch_te, mlx_te) -> None:
     copy_conv1d(torch_te.proj, mlx_te.proj)
 
 
+def copy_source_module_hn_nsf(torch_sm, mlx_sm) -> None:
+    """`SineGen` has no learnable parameters, so only the merge Linear needs copying."""
+    copy_linear(torch_sm.l_linear, mlx_sm.l_linear)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:

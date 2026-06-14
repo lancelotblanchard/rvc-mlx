@@ -607,3 +607,110 @@ class TorchTextEncoder768(torch.nn.Module):
         stats = self.proj(x) * x_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
         return m, logs, x_mask
+
+
+class TorchSineGen(torch.nn.Module):
+    """
+    PyTorch reference for `SineGen`. Modified to accept explicit `rand_ini` and `noise_raw` kwargs so paired-module
+    tests can share the random tensors with the MLX impl (the original RVC implementation samples internally and is
+    intrinsically non-deterministic).
+    """
+
+    def __init__(
+        self,
+        samp_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        noise_std=0.003,
+        voiced_threshold=0,
+        flag_for_pulse=False,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.harmonic_num = harmonic_num
+        self.dim = harmonic_num + 1
+        self.sampling_rate = samp_rate
+        self.voiced_threshold = voiced_threshold
+        self.flag_for_pulse = flag_for_pulse
+
+    def _f02uv(self, f0):
+        uv = torch.ones_like(f0)
+        uv = uv * (f0 > self.voiced_threshold)
+        return uv
+
+    def forward(self, f0, upp, rand_ini=None, noise_raw=None):
+        with torch.no_grad():
+            f0 = f0[:, None].transpose(1, 2)  # (B, T, 1)
+            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device, dtype=f0.dtype)
+            f0_buf[:, :, 0] = f0[:, :, 0]
+            for idx in range(self.harmonic_num):
+                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+            rad_values = (f0_buf / self.sampling_rate) % 1
+            if rand_ini is None:
+                rand_ini = torch.rand(f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device)
+            rand_ini = rand_ini.clone()
+            rand_ini[:, 0] = 0
+            rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+
+            tmp_over_one = torch.cumsum(rad_values, 1)
+            tmp_over_one *= upp
+            tmp_over_one = torch.nn.functional.interpolate(
+                tmp_over_one.transpose(2, 1),
+                scale_factor=float(upp),
+                mode="linear",
+                align_corners=True,
+            ).transpose(2, 1)
+            rad_values = torch.nn.functional.interpolate(
+                rad_values.transpose(2, 1), scale_factor=float(upp), mode="nearest"
+            ).transpose(2, 1)
+            tmp_over_one %= 1
+            tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
+            cumsum_shift = torch.zeros_like(rad_values)
+            cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
+
+            sine_waves = torch.sin(
+                torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * torch.pi
+            )
+            sine_waves = sine_waves * self.sine_amp
+
+            uv = self._f02uv(f0)
+            uv = torch.nn.functional.interpolate(
+                uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
+            ).transpose(2, 1)
+
+            if noise_raw is None:
+                noise_raw = torch.randn_like(sine_waves)
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * noise_raw
+            sine_waves = sine_waves * uv + noise
+        return sine_waves, uv, noise
+
+
+class TorchSourceModuleHnNSF(torch.nn.Module):
+    """PyTorch reference for `SourceModuleHnNSF`. Threads `rand_ini` / `noise_raw` through to `TorchSineGen`."""
+
+    def __init__(
+        self,
+        sampling_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        add_noise_std=0.003,
+        voiced_threshold=0,
+        is_half=False,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = add_noise_std
+        self.is_half = is_half
+        self.l_sin_gen = TorchSineGen(
+            sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold
+        )
+        self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
+        self.l_tanh = torch.nn.Tanh()
+
+    def forward(self, x, upp=1, rand_ini=None, noise_raw=None):
+        sine_wavs, _, _ = self.l_sin_gen(x, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        return sine_merge, None, None

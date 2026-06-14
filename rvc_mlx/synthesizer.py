@@ -20,7 +20,12 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from rvc_mlx.utils import pad_constant, sequence_mask
+from rvc_mlx.utils import (
+    interpolate_linear_axis,
+    interpolate_nearest_axis,
+    pad_constant,
+    sequence_mask,
+)
 
 
 class LayerNorm(nn.Module):
@@ -461,3 +466,176 @@ class TextEncoder768(nn.Module):
         m = stats[..., : self.out_channels]
         logs = stats[..., self.out_channels :]
         return m, logs, x_mask
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# NSF (Neural Source-Filter) source modules.
+#
+# The generator uses harmonic-plus-noise modeling: SineGen produces a bank of sine waves at multiples of f0 (with
+# random noise in unvoiced regions), SourceModuleHnNSF mixes them down to a single excitation signal that the
+# upsampling Conv stack consumes alongside the upsampled latents.
+#
+# SineGen's PyTorch reference is intrinsically random (it samples a per-harmonic initial phase and Gaussian noise
+# for unvoiced regions). For cross-framework testing we expose those random tensors as optional `rand_ini` and
+# `noise_raw` keyword arguments; when omitted, they are generated internally as in the reference.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+class SineGen(nn.Module):
+    """
+    Harmonic sine-wave generator matching the RVC reference.
+
+    Inputs:
+      * `f0`: per-frame fundamental frequency in Hz, shape `(B, T)`. Zero or sub-`voiced_threshold` entries are treated
+        as unvoiced.
+      * `upp`: integer upsampling factor from frame rate to audio rate (typically `prod(upsample_rates)`).
+      * `rand_ini` (optional): `(B, dim)` per-harmonic initial-phase random values in `[0, 1)`. If `None`, sampled
+        internally.
+      * `noise_raw` (optional): unit-variance random tensor of shape `(B, T * upp, dim)` used to fill unvoiced regions.
+        If `None`, sampled internally.
+
+    Outputs `(sine_waves, uv, noise)`, each of shape `(B, T * upp, dim)` where `dim = harmonic_num + 1`.
+    """
+
+    def __init__(
+        self,
+        samp_rate: int,
+        harmonic_num: int = 0,
+        sine_amp: float = 0.1,
+        noise_std: float = 0.003,
+        voiced_threshold: float = 0,
+        flag_for_pulse: bool = False,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.harmonic_num = harmonic_num
+        self.dim = harmonic_num + 1
+        self.sampling_rate = samp_rate
+        self.voiced_threshold = voiced_threshold
+        # `flag_for_pulse` is part of the reference signature; the inference path never sets it to True. Stored
+        # verbatim so downstream consumers can read it but otherwise unused.
+        self.flag_for_pulse = flag_for_pulse
+
+    def _f02uv(self, f0: mx.array) -> mx.array:
+        # f0: any shape. Returns a same-shape float array, 1 where f0 > threshold and 0 elsewhere.
+        return (f0 > self.voiced_threshold).astype(f0.dtype)
+
+    def __call__(
+        self,
+        f0: mx.array,
+        upp: int,
+        rand_ini: Optional[mx.array] = None,
+        noise_raw: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        # f0: (B, T). The reference does `f0[:, None].transpose(1, 2)` which produces (B, T, 1). Channels-last MLX
+        # version: just expand_dims on the last axis.
+        f0_e = mx.expand_dims(f0, -1)  # (B, T, 1)
+        B, T, _ = f0_e.shape
+
+        # Build f0_buf of shape (B, T, dim) where channel k holds f0 * (k + 1) (fundamental and integer harmonics).
+        if self.harmonic_num > 0:
+            multipliers = mx.arange(1, self.dim + 1, dtype=f0_e.dtype)  # (dim,)
+            f0_buf = f0_e * multipliers  # broadcast to (B, T, dim)
+        else:
+            f0_buf = f0_e  # (B, T, 1)
+
+        rad_values = (f0_buf / self.sampling_rate) % 1  # (B, T, dim)
+
+        # Sample (or accept) the per-batch, per-harmonic initial phase. The first column is forced to zero (matches
+        # the reference) so that the fundamental component's phase is deterministic given f0.
+        if rand_ini is None:
+            rand_ini = mx.random.uniform(shape=(B, self.dim))
+        # Zero out the first harmonic's initial phase. Build a (dim,) mask: [0, 1, 1, ..., 1].
+        zero_first = mx.concatenate(
+            [mx.zeros((1,), dtype=rand_ini.dtype), mx.ones((self.dim - 1,), dtype=rand_ini.dtype)],
+            axis=0,
+        ) if self.dim > 1 else mx.zeros((1,), dtype=rand_ini.dtype)
+        rand_ini = rand_ini * zero_first
+        # Add rand_ini to rad_values only at t=0.
+        ini_at_t0 = mx.expand_dims(rand_ini, 1)  # (B, 1, dim)
+        if T > 1:
+            ini_pad = mx.concatenate(
+                [ini_at_t0, mx.zeros((B, T - 1, self.dim), dtype=rad_values.dtype)],
+                axis=1,
+            )
+        else:
+            ini_pad = ini_at_t0
+        rad_values = rad_values + ini_pad.astype(rad_values.dtype)
+
+        # Cumulative phase, then upsample via linear (with align_corners=True) so the reconstructed sine is smooth.
+        tmp_over_one = mx.cumsum(rad_values, axis=1) * upp
+        tmp_over_one = interpolate_linear_axis(tmp_over_one, upp, axis=1)  # (B, T*upp, dim)
+
+        # The "rad_values" themselves are repeated by nearest-neighbour, so each frame's phase increment is uniformly
+        # spread across the `upp` audio samples that span the frame.
+        rad_values_up = interpolate_nearest_axis(rad_values, upp, axis=1)  # (B, T*upp, dim)
+
+        # Where the cumulative phase wraps past 1, inject a -1 shift so the running `cumsum` below stays continuous.
+        tmp_over_one_mod = tmp_over_one % 1
+        diff = tmp_over_one_mod[:, 1:, :] - tmp_over_one_mod[:, :-1, :]
+        wrap_idx = (diff < 0).astype(rad_values_up.dtype)
+        cumsum_shift = mx.concatenate(
+            [mx.zeros((B, 1, self.dim), dtype=rad_values_up.dtype), -wrap_idx], axis=1
+        )
+
+        sine_waves = mx.sin(mx.cumsum(rad_values_up + cumsum_shift, axis=1) * (2 * math.pi))
+        sine_waves = sine_waves * self.sine_amp
+
+        # Voiced/unvoiced mask upsampled to audio rate via nearest-neighbour. Shape (B, T*upp, 1).
+        uv = self._f02uv(f0_e)  # (B, T, 1)
+        uv = interpolate_nearest_axis(uv, upp, axis=1)  # (B, T*upp, 1)
+
+        if noise_raw is None:
+            noise_raw = mx.random.normal(sine_waves.shape).astype(sine_waves.dtype)
+        # noise_amp blends the explicit noise std (voiced regions) with a fraction of sine_amp (unvoiced "breath").
+        noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+        noise = noise_amp * noise_raw
+
+        sine_waves = sine_waves * uv + noise
+        return sine_waves, uv, noise
+
+
+class SourceModuleHnNSF(nn.Module):
+    """
+    Mixes the harmonic sine bank produced by `SineGen` down to a single excitation channel via a Linear + tanh.
+
+    The PyTorch reference also accepts an `is_half` flag and conditionally casts to half precision for the merge.
+    We accept the flag for API parity but do the actual half-precision cast in the downstream generator if needed,
+    keeping this module dtype-agnostic for clarity.
+    """
+
+    def __init__(
+        self,
+        sampling_rate: int,
+        harmonic_num: int = 0,
+        sine_amp: float = 0.1,
+        add_noise_std: float = 0.003,
+        voiced_threshold: float = 0,
+        is_half: bool = False,
+    ):
+        super().__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = add_noise_std
+        self.is_half = is_half
+        self.l_sin_gen = SineGen(
+            sampling_rate,
+            harmonic_num=harmonic_num,
+            sine_amp=sine_amp,
+            noise_std=add_noise_std,
+            voiced_threshold=voiced_threshold,
+        )
+        self.l_linear = nn.Linear(harmonic_num + 1, 1)
+
+    def __call__(
+        self,
+        x: mx.array,
+        upp: int = 1,
+        rand_ini: Optional[mx.array] = None,
+        noise_raw: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, None, None]:
+        sine_wavs, _, _ = self.l_sin_gen(x, upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        # The reference casts sine_wavs to the Linear's weight dtype; MLX broadcasts mixed-dtype matmul, so this is
+        # implicit. We still match the reference's return shape `(sine_merge, None, None)` for API compatibility.
+        sine_merge = mx.tanh(self.l_linear(sine_wavs))
+        return sine_merge, None, None
