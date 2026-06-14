@@ -239,6 +239,76 @@ def to_channels_first(x: mx.array) -> mx.array:
     return mx.transpose(x, (0, 3, 1, 2))
 
 
+# ----------------------------------------------------------------------------------------------------------------------
+# Synthesizer bridge helpers (transformer encoder building blocks).
+#
+# The synthesizer modules use 1D convolutions in channels-last MLX convention. The PyTorch references use Conv1d in
+# channels-first. Weight transposes for Conv1d follow the same pattern as Conv2d, except there's only one spatial
+# (kernel) axis.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def copy_conv1d(torch_conv: torch.nn.Conv1d, mlx_conv: nn.Conv1d) -> None:
+    """
+    PyTorch Conv1d weight shape: (out_channels, in_channels, kernel_size)
+    MLX     Conv1d weight shape: (out_channels, kernel_size, in_channels)  -- channels-last
+    """
+    w = torch_conv.weight.detach().cpu().numpy().transpose(0, 2, 1)
+    mlx_conv.weight = mx.array(w)
+    if torch_conv.bias is not None:
+        mlx_conv.bias = _to_mx(torch_conv.bias)
+
+
+def to_time_last(x: mx.array) -> mx.array:
+    """Convert a 3D channels-first tensor (B, C, T) to MLX channels-last (B, T, C)."""
+    return mx.transpose(x, (0, 2, 1))
+
+
+def to_time_first(x: mx.array) -> mx.array:
+    """Convert a 3D channels-last tensor (B, T, C) back to (B, C, T) for comparison with PyTorch."""
+    return mx.transpose(x, (0, 2, 1))
+
+
+def copy_layer_norm(torch_ln, mlx_ln) -> None:
+    """
+    RVC's `LayerNorm` parametrizes as `gamma`/`beta` (instead of PyTorch's `weight`/`bias` on `nn.LayerNorm`). Both our
+    MLX module and the torch ref follow that convention.
+    """
+    mlx_ln.gamma = _to_mx(torch_ln.gamma)
+    mlx_ln.beta = _to_mx(torch_ln.beta)
+
+
+def copy_ffn(torch_ffn, mlx_ffn) -> None:
+    copy_conv1d(torch_ffn.conv_1, mlx_ffn.conv_1)
+    copy_conv1d(torch_ffn.conv_2, mlx_ffn.conv_2)
+
+
+def copy_multi_head_attention(torch_mha, mlx_mha) -> None:
+    """
+    Copy all four 1x1 Conv1d projections plus, when present, the relative-position embedding tensors. The relative
+    embeddings have shape `(n_heads_rel, 2 * window_size + 1, k_channels)` in both frameworks (no transpose).
+    """
+    copy_conv1d(torch_mha.conv_q, mlx_mha.conv_q)
+    copy_conv1d(torch_mha.conv_k, mlx_mha.conv_k)
+    copy_conv1d(torch_mha.conv_v, mlx_mha.conv_v)
+    copy_conv1d(torch_mha.conv_o, mlx_mha.conv_o)
+    if getattr(torch_mha, "window_size", None) is not None:
+        mlx_mha.emb_rel_k = _to_mx(torch_mha.emb_rel_k)
+        mlx_mha.emb_rel_v = _to_mx(torch_mha.emb_rel_v)
+
+
+def copy_transformer_encoder(torch_enc, mlx_enc) -> None:
+    """Copy the stack of (MultiHeadAttention, LayerNorm, FFN, LayerNorm) blocks that make up RVC's text-encoder."""
+    for t_attn, m_attn in zip(torch_enc.attn_layers, mlx_enc.attn_layers):
+        copy_multi_head_attention(t_attn, m_attn)
+    for t_norm, m_norm in zip(torch_enc.norm_layers_1, mlx_enc.norm_layers_1):
+        copy_layer_norm(t_norm, m_norm)
+    for t_ffn, m_ffn in zip(torch_enc.ffn_layers, mlx_enc.ffn_layers):
+        copy_ffn(t_ffn, m_ffn)
+    for t_norm, m_norm in zip(torch_enc.norm_layers_2, mlx_enc.norm_layers_2):
+        copy_layer_norm(t_norm, m_norm)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:
