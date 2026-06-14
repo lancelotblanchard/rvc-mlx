@@ -24,14 +24,19 @@ from rvc_mlx import rmvpe as rmvpe_mod
 from rvc_mlx import _torch_ref
 from rvc_mlx._convert_bridge import randomize_bn_stats
 from rvc_mlx.convert import (
+    convert_hubert_checkpoint,
     convert_rmvpe_checkpoint,
     convert_synthesizer_checkpoint,
+    ensure_hubert_safetensors,
     ensure_safetensors,
     ensure_synthesizer_safetensors,
     _fuse_weight_norm_state_dict,
     _normalize_synth_config,
+    _remap_hubert_state_dict,
+    _drop_training_only_keys,
     _SYNTH_CONFIG_KEYS,
 )
+from rvc_mlx.hubert import HubertModel
 from rvc_mlx.rmvpe import RMVPE
 from rvc_mlx.synthesizer import SynthesizerTrnMs768NSFsid
 
@@ -309,6 +314,200 @@ class TestConvertSynthesizerCheckpoint:
     def test_ensure_synthesizer_safetensors_rejects_unknown_extension(self, tmp_path):
         with pytest.raises(ValueError, match="Unsupported synthesizer checkpoint extension"):
             ensure_synthesizer_safetensors(str(tmp_path / "weights.bin"))
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# HuBERT converter tests.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+# Scaled-down HuBERT config (mirrors the one in test_hubert.py).
+_SMALL_HUBERT_CONFIG = dict(
+    conv_layers=((16, 10, 5), (16, 3, 2)),
+    extractor_mode="default",
+    embed_dim=64,
+    encoder_ffn_dim=128,
+    encoder_layers=2,
+    encoder_attention_heads=4,
+    pos_conv_kernel=8,
+    pos_conv_groups=4,
+    has_final_proj=False,
+)
+
+
+def _build_torch_hubert_with_random_weights(config, seed=0):
+    """Build a `TorchHubertModel` with deterministic random weights for testing."""
+    torch.manual_seed(seed)
+    model = _torch_ref.TorchHubertModel(**config)
+    model.eval()
+    return model
+
+
+def _fairseq_style_state_dict_from_torch(model, has_final_proj):
+    """
+    Convert a `TorchHubertModel` state_dict to the **fairseq** naming convention + apply `weight_norm` to `pos_conv`
+    so the produced state_dict mimics what a released `hubert_base.pt` looks like. Used to test that
+    `convert_hubert_checkpoint` correctly handles the published format.
+    """
+    sd = model.state_dict()
+    # Apply weight_norm to pos_conv (dim=2). PyTorch's weight_norm adds weight_g/weight_v and removes weight.
+    pc_weight = sd.pop("encoder.pos_conv.conv.weight")
+    # Per-kernel-position norm: norm over dims (0, 1), keep dim 2.
+    weight_v = pc_weight
+    weight_g = torch.linalg.vector_norm(weight_v, dim=(0, 1), keepdim=True)
+    # In fairseq's saved state_dict the key is encoder.pos_conv.0.weight_g (the "0" indexes into nn.Sequential).
+    sd["encoder.pos_conv.0.weight_g"] = weight_g
+    sd["encoder.pos_conv.0.weight_v"] = weight_v
+    # encoder.pos_conv.conv.bias -> encoder.pos_conv.0.bias
+    if "encoder.pos_conv.conv.bias" in sd:
+        sd["encoder.pos_conv.0.bias"] = sd.pop("encoder.pos_conv.conv.bias")
+
+    # Rename feature_extractor.convs.{i}.weight -> feature_extractor.conv_layers.{i}.0.weight, etc.
+    rename: list = []
+    for k in list(sd.keys()):
+        new_k = None
+        if k.startswith("feature_extractor.convs."):
+            # convs.{i}.{suffix} -> conv_layers.{i}.0.{suffix}
+            tail = k[len("feature_extractor.convs.") :]
+            new_k = f"feature_extractor.conv_layers.{tail.split('.', 1)[0]}.0.{tail.split('.', 1)[1]}"
+        elif k.startswith("feature_extractor.norms."):
+            tail = k[len("feature_extractor.norms.") :]
+            new_k = f"feature_extractor.conv_layers.{tail.split('.', 1)[0]}.2.{tail.split('.', 1)[1]}"
+        if new_k is not None:
+            rename.append((k, new_k))
+    for old, new in rename:
+        sd[new] = sd.pop(old)
+
+    # Add some training-only entries the released checkpoint carries (we drop these on load).
+    sd["mask_emb"] = torch.zeros(64)
+    sd["label_embs_concat"] = torch.zeros(100, 64)
+    return sd
+
+
+class TestRemapHubertStateDict:
+    def test_remaps_feature_extractor_keys(self):
+        sd = {
+            "feature_extractor.conv_layers.0.0.weight": torch.zeros(1),
+            "feature_extractor.conv_layers.0.2.weight": torch.zeros(1),
+            "feature_extractor.conv_layers.1.0.weight": torch.zeros(1),
+            "unrelated.weight": torch.zeros(1),
+        }
+        out = _remap_hubert_state_dict(sd)
+        assert "feature_extractor.convs.0.weight" in out
+        assert "feature_extractor.norms.0.weight" in out
+        assert "feature_extractor.convs.1.weight" in out
+        assert "unrelated.weight" in out
+
+    def test_remaps_pos_conv(self):
+        sd = {
+            "encoder.pos_conv.0.weight_g": torch.zeros(1),
+            "encoder.pos_conv.0.weight_v": torch.zeros(1),
+            "encoder.pos_conv.0.bias": torch.zeros(1),
+        }
+        out = _remap_hubert_state_dict(sd)
+        assert "encoder.pos_conv.conv.weight_g" in out
+        assert "encoder.pos_conv.conv.weight_v" in out
+        assert "encoder.pos_conv.conv.bias" in out
+
+
+class TestDropTrainingOnlyKeys:
+    def test_drops_mask_emb_and_label_embs(self):
+        sd = {
+            "mask_emb": torch.zeros(1),
+            "label_embs_concat": torch.zeros(1),
+            "_ema_some_key": torch.zeros(1),
+            "feature_extractor.convs.0.weight": torch.zeros(1),
+        }
+        out = _drop_training_only_keys(sd)
+        assert "feature_extractor.convs.0.weight" in out
+        assert "mask_emb" not in out
+        assert "label_embs_concat" not in out
+        assert "_ema_some_key" not in out
+
+
+class TestFuseWeightNormPosConv:
+    """The pos_conv weight_norm uses `dim=2` (per-kernel-position). Verify the auto-detect path."""
+
+    def test_dim2_weight_norm(self):
+        # Build a known v with `dim=2` weight_norm.
+        torch.manual_seed(0)
+        v = torch.randn(8, 4, 3)  # (out=8, in/g=4, k=3)
+        g = torch.linalg.vector_norm(v, dim=(0, 1), keepdim=True)  # shape (1, 1, 3)
+        sd = {"foo.weight_g": g, "foo.weight_v": v}
+        out = _fuse_weight_norm_state_dict(sd)
+        assert "foo.weight" in out
+        # After fusion, weight == g * v / ||v||_{0,1} == v (since g IS the norm).
+        torch.testing.assert_close(out["foo.weight"], v)
+
+
+class TestConvertHubertCheckpoint:
+    def test_round_trip_fairseq_style(self, tmp_path):
+        torch_model = _build_torch_hubert_with_random_weights(_SMALL_HUBERT_CONFIG, seed=0)
+        sd_fairseq = _fairseq_style_state_dict_from_torch(
+            torch_model, _SMALL_HUBERT_CONFIG["has_final_proj"]
+        )
+        pt_path = str(tmp_path / "hubert.pt")
+        torch.save({"model": sd_fairseq}, pt_path)
+
+        out_path, config_path = convert_hubert_checkpoint(pt_path)
+        assert out_path == str(tmp_path / "hubert.safetensors")
+        assert config_path == str(tmp_path / "hubert.config.json")
+        assert os.path.exists(out_path)
+        assert os.path.exists(config_path)
+
+        # Patch the default config so `from_pretrained` builds the matching architecture. We do this by passing the
+        # saved config explicitly: from_pretrained reads from the JSON, which we wrote with our scaled-down dims.
+        mlx_hubert = HubertModel.from_pretrained(out_path)
+
+        rng = np.random.default_rng(0)
+        audio_np = rng.standard_normal((1, 320)).astype(np.float32)
+        with torch.no_grad():
+            torch_out = torch_model.extract_features(torch.from_numpy(audio_np)).numpy()
+        mlx_out = np.array(mlx_hubert.extract_features(mx.array(audio_np)))
+        np.testing.assert_allclose(mlx_out, torch_out, atol=5e-3, rtol=5e-3)
+
+    def test_round_trip_with_final_proj(self, tmp_path):
+        # v1 / HuBERT-base variant: has final_proj. Convert auto-detects it from the state_dict.
+        cfg = dict(_SMALL_HUBERT_CONFIG)
+        cfg["has_final_proj"] = True
+        torch_model = _build_torch_hubert_with_random_weights(cfg, seed=1)
+        sd_fairseq = _fairseq_style_state_dict_from_torch(torch_model, True)
+        pt_path = str(tmp_path / "hubert_v1.pt")
+        torch.save({"model": sd_fairseq}, pt_path)
+
+        out_path, _ = convert_hubert_checkpoint(pt_path)
+        with open(out_path[: -len(".safetensors")] + ".config.json") as f:
+            saved_config = json.load(f)
+        assert saved_config["has_final_proj"] is True
+
+    def test_round_trip_top_level_state_dict(self, tmp_path):
+        # Some HuBERT releases save the state_dict at the top level rather than nested under "model".
+        torch_model = _build_torch_hubert_with_random_weights(_SMALL_HUBERT_CONFIG, seed=2)
+        sd_fairseq = _fairseq_style_state_dict_from_torch(torch_model, False)
+        pt_path = str(tmp_path / "hubert_flat.pt")
+        torch.save(sd_fairseq, pt_path)
+
+        out_path, _ = convert_hubert_checkpoint(pt_path)
+        assert os.path.exists(out_path)
+
+    def test_ensure_hubert_safetensors_passes_through(self, tmp_path):
+        st = str(tmp_path / "already.safetensors")
+        cfg = str(tmp_path / "already.config.json")
+        open(st, "w").close()
+        with open(cfg, "w") as f:
+            json.dump(_SMALL_HUBERT_CONFIG, f)
+        out_path, config = ensure_hubert_safetensors(st)
+        assert out_path == st
+
+    def test_ensure_hubert_safetensors_missing_config(self, tmp_path):
+        st = str(tmp_path / "orphan.safetensors")
+        open(st, "w").close()
+        with pytest.raises(FileNotFoundError, match="missing its sibling config"):
+            ensure_hubert_safetensors(st)
+
+    def test_ensure_hubert_safetensors_rejects_unknown_extension(self, tmp_path):
+        with pytest.raises(ValueError, match="Unsupported HuBERT checkpoint extension"):
+            ensure_hubert_safetensors(str(tmp_path / "weights.bin"))
 
 
 if __name__ == "__main__":

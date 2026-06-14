@@ -366,6 +366,24 @@ class HubertModel(nn.Module):
         else:
             self.final_proj = None
 
+    @classmethod
+    def from_pretrained(cls, path: str) -> "HubertModel":
+        """
+        Build a `HubertModel` with weights loaded from disk.
+
+        Accepts either an MLX-native `.safetensors` (with sibling `*.config.json`) or the released fairseq
+        `hubert_base.pt` / ContentVec `.pt` checkpoint. For the `.pt` path the conversion runs on first use,
+        producing both files; subsequent loads skip torch entirely. The `has_final_proj` flag is auto-detected
+        from the checkpoint contents (true for HuBERT-base v1, false for ContentVec v2).
+        """
+        from rvc_mlx.convert import ensure_hubert_safetensors
+
+        safetensors_path, config = ensure_hubert_safetensors(path)
+        model = cls(**config)
+        model.load_weights(safetensors_path)
+        model.eval()
+        return model
+
     def extract_features(
         self,
         audio: mx.array,
