@@ -29,10 +29,62 @@ pip install -e .
 
 ## Usage
 
-```python
-from rvc_mlx import your_function
+Run a voice conversion end-to-end from the command line:
 
-# Your usage example
+```bash
+rvc-mlx \
+    --input source.wav \
+    --output converted.wav \
+    --voice path/to/voice.pth \
+    --hubert path/to/hubert_base.pt \
+    --rmvpe path/to/rmvpe.pt \
+    --speaker-id 0 \
+    --pitch-shift 0 \
+    --rms-mix-rate 0.25
+```
+
+Or from Python:
+
+```python
+from rvc_mlx.infer import run_inference
+
+run_inference(
+    input_path="source.wav",
+    output_path="converted.wav",
+    voice="path/to/voice.pth",
+    hubert="path/to/hubert_base.pt",
+    rmvpe="path/to/rmvpe.pt",
+    speaker_id=0,
+    pitch_shift=0,
+)
+```
+
+Released `.pth` / `.pt` checkpoints (RVC voices, fairseq HuBERT, RMVPE) and our native `.safetensors`
+(with sibling `.config.json`) are both accepted. The first call against a `.pth` / `.pt` writes a converted
+`.safetensors` next to the original; subsequent loads skip the conversion (and skip importing PyTorch).
+
+Lower-level Python API for finer control:
+
+```python
+from types import SimpleNamespace
+
+from rvc_mlx.audio import load_audio_16k, save_audio
+from rvc_mlx.hubert import HubertModel
+from rvc_mlx.pipeline import Pipeline
+from rvc_mlx.rmvpe import RMVPE
+from rvc_mlx.synthesizer import SynthesizerTrnMs768NSFsid
+
+hubert = HubertModel.from_pretrained("hubert_base.pt")
+rmvpe = RMVPE.from_pretrained("rmvpe.pt")
+voice = SynthesizerTrnMs768NSFsid.from_pretrained("voice.pth")
+
+cfg = SimpleNamespace(x_pad=1, x_query=6, x_center=38, x_max=41, is_half=False,
+                     rmvpe_root=None, hubert_root=None)
+pipe = Pipeline(tgt_sr=voice.sr, config=cfg, rmvpe=rmvpe, hubert=hubert)
+
+audio = load_audio_16k("source.wav")
+converted = pipe.pipeline(voice, audio, sid=0, f0_up_key=0)
+save_audio("converted.wav", converted, voice.sr)
 ```
 
 ## Development
