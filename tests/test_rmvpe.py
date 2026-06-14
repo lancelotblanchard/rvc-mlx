@@ -26,6 +26,18 @@ from rvc_mlx.rmvpe import (
     RMVPE,
 )
 
+from rvc_mlx._torch_ref import (
+    TorchBiGRU as _TorchBiGRU,
+    TorchConvBlockRes as _TorchConvBlockRes,
+    TorchDecoder as _TorchDecoder,
+    TorchDeepUnet as _TorchDeepUnet,
+    TorchE2E as _TorchE2E,
+    TorchEncoder as _TorchEncoder,
+    TorchIntermediate as _TorchIntermediate,
+    TorchResDecoderBlock as _TorchResDecoderBlock,
+    TorchResEncoderBlock as _TorchResEncoderBlock,
+)
+
 from .mlx_torch_comparison_framework import BaseOperationTest, OperationTestSuite
 from .torch_bridge import (
     copy_bi_gru,
@@ -272,64 +284,6 @@ class TestRmvpeMelSpectrogramExplicitNFft(BaseOperationTest):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
-class _TorchConvBlockRes(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC ConvBlockRes."""
-
-    def __init__(self, in_channels, out_channels, momentum=0.01):
-        super().__init__()
-        self.conv = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=(3, 3),
-                stride=(1, 1),
-                padding=(1, 1),
-                bias=False,
-            ),
-            torch.nn.BatchNorm2d(out_channels, momentum=momentum),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                in_channels=out_channels,
-                out_channels=out_channels,
-                kernel_size=(3, 3),
-                stride=(1, 1),
-                padding=(1, 1),
-                bias=False,
-            ),
-            torch.nn.BatchNorm2d(out_channels, momentum=momentum),
-            torch.nn.ReLU(),
-        )
-        if in_channels != out_channels:
-            self.shortcut = torch.nn.Conv2d(in_channels, out_channels, (1, 1))
-
-    def forward(self, x):
-        if not hasattr(self, "shortcut"):
-            return self.conv(x) + x
-        return self.conv(x) + self.shortcut(x)
-
-
-class _TorchResEncoderBlock(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC ResEncoderBlock."""
-
-    def __init__(self, in_channels, out_channels, kernel_size, n_blocks=1, momentum=0.01):
-        super().__init__()
-        self.n_blocks = n_blocks
-        self.conv = torch.nn.ModuleList()
-        self.conv.append(_TorchConvBlockRes(in_channels, out_channels, momentum))
-        for _ in range(n_blocks - 1):
-            self.conv.append(_TorchConvBlockRes(out_channels, out_channels, momentum))
-        self.kernel_size = kernel_size
-        if self.kernel_size is not None:
-            self.pool = torch.nn.AvgPool2d(kernel_size=kernel_size)
-
-    def forward(self, x):
-        for conv in self.conv:
-            x = conv(x)
-        if self.kernel_size is not None:
-            return x, self.pool(x)
-        return x
-
-
 def _build_conv_block_res_pair(in_channels, out_channels, momentum=0.01, seed=0):
     """Build a matched (mlx_fn, torch_fn) pair for ConvBlockRes, with eval mode and copied weights."""
     torch.manual_seed(seed)
@@ -523,145 +477,6 @@ class TestRmvpeResEncoderBlockNoPool(BaseOperationTest):
 # BN running stats, run forward in eval mode, and compare. All inputs are channels-first PyTorch-shaped (B, C, H, W);
 # the MLX wrapper transposes to channels-last on the way in and back on the way out.
 # ----------------------------------------------------------------------------------------------------------------------
-
-
-class _TorchEncoder(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC encoder (called `RmvpeEncoder` in the original)."""
-
-    def __init__(
-        self,
-        in_channels,
-        in_size,
-        n_encoders,
-        kernel_size,
-        n_blocks,
-        out_channels=16,
-        momentum=0.01,
-    ):
-        super().__init__()
-        self.n_encoders = n_encoders
-        self.bn = torch.nn.BatchNorm2d(in_channels, momentum=momentum)
-        self.layers = torch.nn.ModuleList()
-        for _ in range(n_encoders):
-            self.layers.append(
-                _TorchResEncoderBlock(in_channels, out_channels, kernel_size, n_blocks, momentum)
-            )
-            in_channels = out_channels
-            out_channels *= 2
-            in_size //= 2
-        self.out_size = in_size
-        self.out_channel = out_channels
-
-    def forward(self, x):
-        concat_tensors = []
-        x = self.bn(x)
-        for layer in self.layers:
-            t, x = layer(x)
-            concat_tensors.append(t)
-        return x, concat_tensors
-
-
-class _TorchIntermediate(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC Intermediate block."""
-
-    def __init__(self, in_channels, out_channels, n_inters, n_blocks, momentum=0.01):
-        super().__init__()
-        self.n_inters = n_inters
-        self.layers = torch.nn.ModuleList()
-        self.layers.append(_TorchResEncoderBlock(in_channels, out_channels, None, n_blocks, momentum))
-        for _ in range(n_inters - 1):
-            self.layers.append(_TorchResEncoderBlock(out_channels, out_channels, None, n_blocks, momentum))
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-class _TorchResDecoderBlock(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC ResDecoderBlock."""
-
-    def __init__(self, in_channels, out_channels, stride, n_blocks=1, momentum=0.01):
-        super().__init__()
-        out_padding = (0, 1) if stride == (1, 2) else (1, 1)
-        self.n_blocks = n_blocks
-        self.conv1 = torch.nn.Sequential(
-            torch.nn.ConvTranspose2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=(3, 3),
-                stride=stride,
-                padding=(1, 1),
-                output_padding=out_padding,
-                bias=False,
-            ),
-            torch.nn.BatchNorm2d(out_channels, momentum=momentum),
-            torch.nn.ReLU(),
-        )
-        self.conv2 = torch.nn.ModuleList()
-        self.conv2.append(_TorchConvBlockRes(out_channels * 2, out_channels, momentum))
-        for _ in range(n_blocks - 1):
-            self.conv2.append(_TorchConvBlockRes(out_channels, out_channels, momentum))
-
-    def forward(self, x, concat_tensor):
-        x = self.conv1(x)
-        x = torch.cat((x, concat_tensor), dim=1)
-        for conv2 in self.conv2:
-            x = conv2(x)
-        return x
-
-
-class _TorchDecoder(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC decoder (`RmvpeDecoder`)."""
-
-    def __init__(self, in_channels, n_decoders, stride, n_blocks, momentum=0.01):
-        super().__init__()
-        self.layers = torch.nn.ModuleList()
-        self.n_decoders = n_decoders
-        for _ in range(n_decoders):
-            out_channels = in_channels // 2
-            self.layers.append(
-                _TorchResDecoderBlock(in_channels, out_channels, stride, n_blocks, momentum)
-            )
-            in_channels = out_channels
-
-    def forward(self, x, concat_tensors):
-        for i, layer in enumerate(self.layers):
-            x = layer(x, concat_tensors[-1 - i])
-        return x
-
-
-class _TorchDeepUnet(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC DeepUnet."""
-
-    def __init__(
-        self,
-        kernel_size,
-        n_blocks,
-        en_de_layers=5,
-        inter_layers=4,
-        in_channels=1,
-        en_out_channels=16,
-    ):
-        super().__init__()
-        self.encoder = _TorchEncoder(
-            in_channels, 128, en_de_layers, kernel_size, n_blocks, en_out_channels
-        )
-        self.intermediate = _TorchIntermediate(
-            self.encoder.out_channel // 2,
-            self.encoder.out_channel,
-            inter_layers,
-            n_blocks,
-        )
-        self.decoder = _TorchDecoder(
-            self.encoder.out_channel, en_de_layers, kernel_size, n_blocks
-        )
-
-    def forward(self, x):
-        x, concat_tensors = self.encoder(x)
-        x = self.intermediate(x)
-        x = self.decoder(x, concat_tensors)
-        return x
 
 
 # ---------- Builders ---------------------------------------------------------------------------------------------------
@@ -968,54 +783,6 @@ class TestRmvpeDeepUnet(BaseOperationTest):
 # ----------------------------------------------------------------------------------------------------------------------
 
 
-class _TorchBiGRU(torch.nn.Module):
-    """Faithful PyTorch reference: a bidirectional, multi-layer GRU."""
-
-    def __init__(self, input_features, hidden_features, num_layers):
-        super().__init__()
-        self.gru = torch.nn.GRU(
-            input_features,
-            hidden_features,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
-
-    def forward(self, x):
-        return self.gru(x)[0]
-
-
-class _TorchE2E(torch.nn.Module):
-    """Faithful PyTorch reference for the RVC E2E pitch network (n_gru > 0 path only)."""
-
-    def __init__(
-        self,
-        n_blocks,
-        n_gru,
-        kernel_size,
-        en_de_layers=5,
-        inter_layers=4,
-        in_channels=1,
-        en_out_channels=16,
-    ):
-        super().__init__()
-        self.unet = _TorchDeepUnet(
-            kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels
-        )
-        self.cnn = torch.nn.Conv2d(en_out_channels, 3, (3, 3), padding=(1, 1))
-        self.fc = torch.nn.Sequential(
-            _TorchBiGRU(3 * 128, 256, n_gru),
-            torch.nn.Linear(512, 360),
-            torch.nn.Dropout(0.25),
-            torch.nn.Sigmoid(),
-        )
-
-    def forward(self, mel):
-        mel = mel.transpose(-1, -2).unsqueeze(1)
-        x = self.cnn(self.unet(mel)).transpose(1, 2).flatten(-2)
-        return self.fc(x)
-
-
 def _build_bi_gru_pair(input_features, hidden_features, num_layers, seed=0):
     torch.manual_seed(seed)
     torch_mod = _TorchBiGRU(input_features, hidden_features, num_layers)
@@ -1201,9 +968,11 @@ class _TorchRMVPE:
         return f0
 
     def infer_from_audio(self, audio, thred=0.03):
-        mel = self.mel_extractor(audio)
+        # 1D-in / 1D-out, matching reference RVC RMVPE.
+        assert audio.ndim == 1
+        mel = self.mel_extractor(audio.unsqueeze(0))
         hidden = self.mel2hidden(mel)
-        return self.decode(hidden, thred=thred)
+        return self.decode(hidden, thred=thred)[0]
 
 
 def _build_rmvpe_pair(**e2e_config):
@@ -1333,7 +1102,7 @@ class TestRmvpeInferFromAudio(BaseOperationTest):
         cls.suite.add_test_case(
             name="infer_basic",
             inputs={
-                "audio": rng.standard_normal((1, 16000)).astype(np.float32),
+                "audio": rng.standard_normal((16000,)).astype(np.float32),
                 "thred": 0.03,
             },
             description="End-to-end inference; random weights so output values are arbitrary, but MLX and PyTorch agree",

@@ -370,7 +370,9 @@ class E2E(nn.Module):
     ):
         super().__init__()
         if not n_gru:
-            raise NotImplementedError("E2E without GRU layers is not supported (n_gru must be > 0).")
+            raise NotImplementedError(
+                "E2E without GRU layers is not supported (n_gru must be > 0)."
+            )
         self.unet = DeepUnet(
             kernel_size, n_blocks, en_de_layers, inter_layers, in_channels, en_out_channels
         )
@@ -397,6 +399,19 @@ class E2E(nn.Module):
         return x
 
 
+# Hyperparameters of the released RVC `rmvpe.pt` checkpoint. Pinned here (and mirrored in `rvc_mlx._torch_ref` for
+# the conversion side) so `RMVPE.from_pretrained` can build the right shape without the caller specifying them.
+_DEFAULT_E2E_CONFIG = dict(
+    n_blocks=4,
+    n_gru=1,
+    kernel_size=(2, 2),
+    en_de_layers=5,
+    inter_layers=4,
+    in_channels=1,
+    en_out_channels=16,
+)
+
+
 class RMVPE:
     """
     Orchestration wrapper around `MelSpectrogram` and the `E2E` pitch network. Mirrors the inference path of the RVC
@@ -415,6 +430,26 @@ class RMVPE:
     _NUM_BINS = 360
     _PAD = 4
 
+    @classmethod
+    def from_pretrained(cls, path: str, is_half: bool = False) -> "RMVPE":
+        """
+        Build an `RMVPE` with weights loaded from disk.
+
+        Accepts either an MLX-native `.safetensors` file or the original RVC `.pt` checkpoint. For `.pt`, the file is
+        converted on first use to a sibling `.safetensors` (via `rvc_mlx.convert`); subsequent loads skip the
+        conversion. Torch is only imported when a `.pt` actually needs converting.
+        """
+        # Late import to avoid a circular import (convert.py imports rmvpe.E2E for the destination model).
+        from rvc_mlx.convert import ensure_safetensors
+
+        safetensors_path = ensure_safetensors(path, is_half=is_half)
+        model = E2E(**_DEFAULT_E2E_CONFIG)
+        model.load_weights(safetensors_path)
+        # Inference-only: pin BatchNorm to use the running stats baked into the checkpoint. The train/eval flag is
+        # not part of the safetensors, so a freshly-built MLX module defaults to train mode after `load_weights`.
+        model.eval()
+        return cls(model=model, is_half=is_half)
+
     def __init__(self, model: E2E, is_half: bool = False):
         self.is_half = is_half
         self.mel_extractor = MelSpectrogram(
@@ -430,7 +465,9 @@ class RMVPE:
         self.model = model
         cents_mapping = self._CENTS_STEP * np.arange(self._NUM_BINS) + self._CENTS_OFFSET
         # Pad on both sides so windowed neighbours around bin 0 / NUM_BINS-1 stay in range without index clamping.
-        self.cents_mapping = np.pad(cents_mapping, (self._PAD, self._PAD))  # length: NUM_BINS + 2 * PAD = 368
+        self.cents_mapping = np.pad(
+            cents_mapping, (self._PAD, self._PAD)
+        )  # length: NUM_BINS + 2 * PAD = 368
 
     def mel2hidden(self, mel: mx.array) -> mx.array:
         """
@@ -488,9 +525,12 @@ class RMVPE:
 
     def infer_from_audio(self, audio: mx.array, thred: float = 0.03) -> np.ndarray:
         """
-        Full RMVPE inference: raw audio in -> per-frame f0 (Hz) out. `audio` should be shape (B, L) at 16 kHz.
-        Returns a NumPy array of shape (B, T) where T is the number of frames after STFT framing.
+        Full RMVPE inference: raw audio in -> per-frame f0 (Hz) out. Matches the reference contract: `audio` is a 1D
+        array of samples at 16 kHz, and the returned f0 is 1D of shape (T,). Use `mel2hidden` + `decode` directly if
+        you need batched inference.
         """
-        mel = self.mel_extractor(audio)
+        if audio.ndim != 1:
+            raise ValueError(f"Expected a 1D audio array, got shape {audio.shape}")
+        mel = self.mel_extractor(mx.expand_dims(audio, 0))
         hidden = self.mel2hidden(mel)
-        return self.decode(hidden, thred=thred)
+        return self.decode(hidden, thred=thred)[0]
