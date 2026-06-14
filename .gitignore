@@ -2,6 +2,7 @@
 htmlcov
 rvc_mlx.egg-info
 .coverage
+coverage.xml
 __pycache__
 
 .DS_Store

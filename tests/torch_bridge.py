@@ -1,0 +1,27 @@
+"""
+Backwards-compatible re-export.
+
+The bridge helpers moved to `rvc_mlx._convert_bridge` so the checkpoint converter can reuse them. Tests still import
+from this module; it just forwards everything.
+"""
+
+from rvc_mlx._convert_bridge import *  # noqa: F401,F403
+from rvc_mlx._convert_bridge import (  # noqa: F401 — explicit re-export for IDE/lint discovery
+    copy_conv2d,
+    copy_conv_transpose2d,
+    copy_batchnorm,
+    randomize_bn_stats,
+    copy_conv_block_res,
+    copy_res_encoder_block,
+    copy_res_decoder_block,
+    copy_encoder,
+    copy_intermediate,
+    copy_decoder,
+    copy_deep_unet,
+    copy_bi_gru,
+    copy_linear,
+    copy_e2e,
+    to_channels_last,
+    to_channels_first,
+    set_eval,
+)
