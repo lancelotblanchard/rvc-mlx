@@ -309,6 +309,19 @@ def copy_transformer_encoder(torch_enc, mlx_enc) -> None:
         copy_layer_norm(t_norm, m_norm)
 
 
+def copy_embedding(torch_emb: torch.nn.Embedding, mlx_emb: nn.Embedding) -> None:
+    """PyTorch and MLX Embedding share weight shape `(num_embeddings, embedding_dim)`."""
+    mlx_emb.weight = _to_mx(torch_emb.weight)
+
+
+def copy_text_encoder_768(torch_te, mlx_te) -> None:
+    """Copy the full TextEncoder768 (phone Linear + pitch Embedding + transformer Encoder + 1x1 projection)."""
+    copy_linear(torch_te.emb_phone, mlx_te.emb_phone)
+    copy_embedding(torch_te.emb_pitch, mlx_te.emb_pitch)
+    copy_transformer_encoder(torch_te.encoder, mlx_te.encoder)
+    copy_conv1d(torch_te.proj, mlx_te.proj)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:

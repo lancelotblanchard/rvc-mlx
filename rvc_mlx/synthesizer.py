@@ -15,12 +15,12 @@ follow-up commits.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from rvc_mlx.utils import pad_constant
+from rvc_mlx.utils import pad_constant, sequence_mask
 
 
 class LayerNorm(nn.Module):
@@ -391,3 +391,73 @@ class Encoder(nn.Module):
             x = norm2(x + y)
         x = x * x_mask
         return x
+
+
+class TextEncoder768(nn.Module):
+    """
+    The text encoder used by `SynthesizerTrnMs768NSFsid`. Maps 768-dim per-frame phone features (typically HuBERT-like
+    content embeddings, hence the `768` in the name) plus an integer pitch class per frame to a posterior parameterized
+    by `(m, logs)` of shape `(B, T, out_channels)`. The transformer encoder runs in the middle.
+
+    Channels-last MLX convention: `phone` is `(B, T, 768)`, `pitch` is `(B, T)` integers in `[0, 255]` (or None for the
+    "no pitch" variant), and `lengths` is `(B,)`. The returned `m`, `logs` are `(B, T, out_channels)` and `x_mask` is
+    `(B, T, 1)`. The PyTorch reference uses channels-first; the test bridge transposes at the boundary.
+    """
+
+    def __init__(
+        self,
+        out_channels: int,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int,
+        kernel_size: int,
+        p_dropout: float,
+    ):
+        super().__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.emb_phone = nn.Linear(768, hidden_channels)
+        # The reference uses `LeakyReLU(0.1, inplace=True)`; inplace is a no-op semantics-wise for the test.
+        self.lrelu = nn.LeakyReLU(negative_slope=0.1)
+        self.emb_pitch = nn.Embedding(256, hidden_channels)
+        self.encoder = Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )
+        # 1x1 Conv1d projecting hidden_channels -> 2 * out_channels (split into mean and log-std).
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, kernel_size=1)
+
+    def __call__(
+        self,
+        phone: mx.array,
+        pitch: Optional[mx.array],
+        lengths: mx.array,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        # phone: (B, T, 768); pitch: (B, T) or None; lengths: (B,)
+        if pitch is None:
+            x = self.emb_phone(phone)
+        else:
+            x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        x = x * math.sqrt(self.hidden_channels)
+        x = self.lrelu(x)
+        # Build x_mask of shape (B, T, 1) where T is the second-to-last axis of x.
+        T = x.shape[1]
+        mask = sequence_mask(lengths, T).astype(x.dtype)  # (B, T)
+        x_mask = mx.expand_dims(mask, -1)  # (B, T, 1)
+        x = self.encoder(x * x_mask, x_mask)
+        stats = self.proj(x) * x_mask  # (B, T, 2 * out_channels)
+        # Split along the channel axis. RVC's `torch.split(stats, out_channels, dim=1)` on channels-first becomes a
+        # last-axis split here.
+        m = stats[..., : self.out_channels]
+        logs = stats[..., self.out_channels :]
+        return m, logs, x_mask

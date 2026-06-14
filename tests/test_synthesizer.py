@@ -18,11 +18,13 @@ from rvc_mlx.synthesizer import (
     FFN,
     LayerNorm,
     MultiHeadAttention,
+    TextEncoder768,
 )
 from rvc_mlx._torch_ref import (
     TorchFFN,
     TorchLayerNorm,
     TorchMultiHeadAttention,
+    TorchTextEncoder768,
     TorchTransformerEncoder,
 )
 
@@ -31,6 +33,7 @@ from .torch_bridge import (
     copy_ffn,
     copy_layer_norm,
     copy_multi_head_attention,
+    copy_text_encoder_768,
     copy_transformer_encoder,
     set_eval,
     to_time_first,
@@ -419,6 +422,120 @@ class TestSynthesizerEncoderRvcDefaults(BaseOperationTest):
             description="RVC-default encoder; second batch entry has 12 trailing masked frames",
             atol=1e-3,
             rtol=1e-3,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# TextEncoder768. Composes phone Linear + pitch Embedding + transformer Encoder + 1x1 projection.
+# Returns a (m, logs, x_mask) tuple; the framework compares one array at a time, so we wrap each output in its own
+# test class.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+# RVC's default text-encoder config (from `SynthesizerTrnMs768NSFsid.__init__`).
+TEXT_ENCODER_768_DEFAULTS = dict(
+    out_channels=192,
+    hidden_channels=192,
+    filter_channels=768,
+    n_heads=2,
+    n_layers=6,
+    kernel_size=3,
+    p_dropout=0.0,
+)
+
+
+def _build_text_encoder_768_pair(seed=0, **init_overrides):
+    init_params = {**TEXT_ENCODER_768_DEFAULTS, **init_overrides}
+    torch.manual_seed(seed)
+    t_te = TorchTextEncoder768(**init_params)
+    m_te = TextEncoder768(**init_params)
+    copy_text_encoder_768(t_te, m_te)
+    set_eval(t_te, m_te)
+    return t_te, m_te
+
+
+def _make_text_encoder_768_wrappers(t_te, m_te, output_index: int):
+    """
+    The module returns `(m, logs, x_mask)`. `output_index` picks which tensor to expose (0/1/2). The PyTorch result is
+    channels-first; the MLX result is channels-last. We transpose the MLX side to channels-first to compare.
+    """
+
+    def mlx_fn(phone, pitch, lengths):
+        out = m_te(phone, pitch, lengths)[output_index]
+        return to_time_first(out)
+
+    def torch_fn(phone, pitch, lengths):
+        with torch.no_grad():
+            return t_te(phone, pitch, lengths)[output_index]
+
+    return mlx_fn, torch_fn
+
+
+def _text_encoder_inputs(batch, length, valid_lengths, rng):
+    """Build (phone, pitch, lengths) for the text encoder tests."""
+    phone = rng.standard_normal((batch, length, 768)).astype(np.float32)
+    pitch = rng.integers(0, 256, size=(batch, length)).astype(np.int64)
+    lengths = np.array(valid_lengths, dtype=np.int64)
+    return phone, pitch, lengths
+
+
+class TestSynthesizerTextEncoder768Mean(BaseOperationTest):
+    """TextEncoder768 returning the `m` (mean) head of the posterior. Full-batch with mixed lengths."""
+
+    @classmethod
+    def setup_class(cls):
+        t_te, m_te = _build_text_encoder_768_pair()
+        mlx_fn, torch_fn = _make_text_encoder_768_wrappers(t_te, m_te, output_index=0)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "text_encoder_768_m")
+
+        rng = np.random.default_rng(0)
+        phone, pitch, lengths = _text_encoder_inputs(2, 32, [32, 20], rng)
+        cls.suite.add_test_case(
+            name="m_partial_mask",
+            inputs={"phone": phone, "pitch": pitch, "lengths": lengths},
+            description="Mean head; second batch entry has 12 trailing masked frames",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+class TestSynthesizerTextEncoder768Logs(BaseOperationTest):
+    """TextEncoder768 returning the `logs` (log-std) head of the posterior."""
+
+    @classmethod
+    def setup_class(cls):
+        t_te, m_te = _build_text_encoder_768_pair()
+        mlx_fn, torch_fn = _make_text_encoder_768_wrappers(t_te, m_te, output_index=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "text_encoder_768_logs")
+
+        rng = np.random.default_rng(1)
+        phone, pitch, lengths = _text_encoder_inputs(1, 24, [24], rng)
+        cls.suite.add_test_case(
+            name="logs_full_mask",
+            inputs={"phone": phone, "pitch": pitch, "lengths": lengths},
+            description="Log-std head; fully valid single-sequence batch",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+class TestSynthesizerTextEncoder768Mask(BaseOperationTest):
+    """TextEncoder768 returning the `x_mask` derived from `lengths`. Pure boundary check."""
+
+    @classmethod
+    def setup_class(cls):
+        t_te, m_te = _build_text_encoder_768_pair()
+        mlx_fn, torch_fn = _make_text_encoder_768_wrappers(t_te, m_te, output_index=2)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "text_encoder_768_xmask")
+
+        rng = np.random.default_rng(2)
+        phone, pitch, lengths = _text_encoder_inputs(3, 16, [16, 10, 7], rng)
+        cls.suite.add_test_case(
+            name="xmask_varied",
+            inputs={"phone": phone, "pitch": pitch, "lengths": lengths},
+            description="x_mask derived from per-batch lengths; verifies sequence_mask shape and dtype",
+            atol=1e-6,
+            rtol=1e-6,
         )
 
 

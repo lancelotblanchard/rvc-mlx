@@ -484,6 +484,14 @@ class TorchMultiHeadAttention(torch.nn.Module):
         return torch.unsqueeze(torch.unsqueeze(-torch.log1p(torch.abs(diff)), 0), 0)
 
 
+def _torch_sequence_mask(length, max_length=None):
+    """Local helper duplicating the RVC reference's `sequence_mask` so this module stays self-contained."""
+    if max_length is None:
+        max_length = length.max()
+    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+    return x.unsqueeze(0) < length.unsqueeze(1)
+
+
 class TorchTransformerEncoder(torch.nn.Module):
     """RVC's transformer encoder. Distinct from `TorchEncoder` (the RMVPE U-Net encoder)."""
 
@@ -548,3 +556,54 @@ class TorchTransformerEncoder(torch.nn.Module):
             x = norm2(x + y)
         x = x * x_mask
         return x
+
+
+class TorchTextEncoder768(torch.nn.Module):
+    """PyTorch reference for RVC's `TextEncoder768`. Mirrors the original source layout exactly."""
+
+    def __init__(
+        self,
+        out_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+    ):
+        super().__init__()
+        import math as _math
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.emb_phone = torch.nn.Linear(768, hidden_channels)
+        self.lrelu = torch.nn.LeakyReLU(0.1, inplace=True)
+        self.emb_pitch = torch.nn.Embedding(256, hidden_channels)
+        self.encoder = TorchTransformerEncoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )
+        self.proj = torch.nn.Conv1d(hidden_channels, out_channels * 2, 1)
+        self._sqrt_hidden = _math.sqrt(hidden_channels)
+
+    def forward(self, phone, pitch, lengths):
+        if pitch is None:
+            x = self.emb_phone(phone)
+        else:
+            x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        x = x * self._sqrt_hidden  # [B, T, hidden]
+        x = self.lrelu(x)
+        x = torch.transpose(x, 1, -1)  # [B, hidden, T]
+        x_mask = torch.unsqueeze(_torch_sequence_mask(lengths, x.size(2)), 1).to(x.dtype)
+        x = self.encoder(x * x_mask, x_mask)
+        stats = self.proj(x) * x_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        return m, logs, x_mask

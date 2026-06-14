@@ -26,6 +26,8 @@ from rvc_mlx._convert_bridge import (  # noqa: F401 — explicit re-export for I
     copy_ffn,
     copy_multi_head_attention,
     copy_transformer_encoder,
+    copy_embedding,
+    copy_text_encoder_768,
     to_channels_last,
     to_channels_first,
     to_time_last,
