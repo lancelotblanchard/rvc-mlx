@@ -1143,6 +1143,26 @@ class SynthesizerTrnMs768NSFsid(nn.Module):
 
     _SR_ALIAS = {"32k": 32000, "40k": 40000, "48k": 48000}
 
+    @classmethod
+    def from_pretrained(cls, path: str) -> "SynthesizerTrnMs768NSFsid":
+        """
+        Build a `SynthesizerTrnMs768NSFsid` with weights loaded from disk.
+
+        Accepts either an MLX-native `.safetensors` file (with sibling `*.config.json`) or the released RVC `.pth`
+        per-voice checkpoint. For `.pth` the file is converted on first use to a sibling `.safetensors` plus
+        `.config.json`; subsequent loads skip the conversion. Torch is only imported when a `.pth` actually needs
+        converting.
+        """
+        # Late import to avoid pulling torch into the runtime path; `convert` lazy-imports torch only on the
+        # conversion branch.
+        from rvc_mlx.convert import ensure_synthesizer_safetensors
+
+        safetensors_path, config = ensure_synthesizer_safetensors(path)
+        model = cls(**config)
+        model.load_weights(safetensors_path)
+        model.eval()
+        return model
+
     def __init__(
         self,
         spec_channels: int,
