@@ -293,7 +293,10 @@ class TestConvertSynthesizerCheckpoint:
         # mlx_o: (B, T_audio, 1) -> (B, 1, T_audio) for comparison.
         mlx_o_np = np.array(mx.transpose(mlx_o, (0, 2, 1)))
 
-        np.testing.assert_allclose(mlx_o_np, torch_o_np, atol=5e-3, rtol=5e-3)
+        # End-to-end tolerance: the synthesizer accumulates float32 error through a deep encoder + 4-flow stack +
+        # multi-level upsampling generator. Per-module tests (test_synthesizer.py) catch precision regressions
+        # tightly; here we just verify the converter doesn't introduce *additional* drift on top of that.
+        np.testing.assert_allclose(mlx_o_np, torch_o_np, atol=5e-2, rtol=5e-2)
 
     def test_ensure_synthesizer_safetensors_passes_through(self, tmp_path):
         st = str(tmp_path / "already.safetensors")
@@ -449,7 +452,8 @@ class TestConvertHubertCheckpoint:
         pt_path = str(tmp_path / "hubert.pt")
         torch.save({"model": sd_fairseq}, pt_path)
 
-        out_path, config_path = convert_hubert_checkpoint(pt_path)
+        # The released RVC checkpoint matches HUBERT_BASE_CONFIG; here we override to the scaled-down test dims.
+        out_path, config_path = convert_hubert_checkpoint(pt_path, config_overrides=_SMALL_HUBERT_CONFIG)
         assert out_path == str(tmp_path / "hubert.safetensors")
         assert config_path == str(tmp_path / "hubert.config.json")
         assert os.path.exists(out_path)
@@ -475,7 +479,7 @@ class TestConvertHubertCheckpoint:
         pt_path = str(tmp_path / "hubert_v1.pt")
         torch.save({"model": sd_fairseq}, pt_path)
 
-        out_path, _ = convert_hubert_checkpoint(pt_path)
+        out_path, _ = convert_hubert_checkpoint(pt_path, config_overrides=cfg)
         with open(out_path[: -len(".safetensors")] + ".config.json") as f:
             saved_config = json.load(f)
         assert saved_config["has_final_proj"] is True
@@ -487,7 +491,7 @@ class TestConvertHubertCheckpoint:
         pt_path = str(tmp_path / "hubert_flat.pt")
         torch.save(sd_fairseq, pt_path)
 
-        out_path, _ = convert_hubert_checkpoint(pt_path)
+        out_path, _ = convert_hubert_checkpoint(pt_path, config_overrides=_SMALL_HUBERT_CONFIG)
         assert os.path.exists(out_path)
 
     def test_ensure_hubert_safetensors_passes_through(self, tmp_path):

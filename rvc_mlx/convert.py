@@ -325,6 +325,7 @@ def convert_hubert_checkpoint(
     pt_path: str,
     out_path: Optional[str] = None,
     has_final_proj: Optional[bool] = None,
+    config_overrides: Optional[Dict] = None,
 ) -> Tuple[str, str]:
     """
     Convert a fairseq HuBERT / ContentVec PyTorch checkpoint to MLX safetensors + config JSON.
@@ -338,6 +339,9 @@ def convert_hubert_checkpoint(
         always written to a sibling `<stem>.config.json`.
     :param has_final_proj: optional explicit override for the `has_final_proj` flag. Set to `True` for
         HuBERT-base v1, `False` for ContentVec v2. `None` (default) auto-detects from the state_dict.
+    :param config_overrides: optional dict of architecture hyperparameters to override `HUBERT_BASE_CONFIG`. Useful
+        for non-standard checkpoints (e.g. test fixtures with smaller dims, or HuBERT-Large variants). Unset keys
+        fall back to `HUBERT_BASE_CONFIG`.
     :returns: `(safetensors_path, config_json_path)`.
     """
     import torch
@@ -367,6 +371,8 @@ def convert_hubert_checkpoint(
     state_dict = _fuse_weight_norm_state_dict(state_dict)
 
     config = dict(HUBERT_BASE_CONFIG)
+    if config_overrides:
+        config.update(config_overrides)
     config["has_final_proj"] = has_final_proj
 
     torch_model = TorchHubertModel(**config)
