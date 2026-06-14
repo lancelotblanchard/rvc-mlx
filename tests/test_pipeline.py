@@ -15,10 +15,12 @@ side is covered separately in `tests/test_rmvpe.py`.
 
 from __future__ import annotations
 
+import mlx.core as mx
 import numpy as np
 import pytest
 
 from rvc_mlx.pipeline import Pipeline
+from rvc_mlx.synthesizer import SynthesizerTrnMs768NSFsid
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +234,133 @@ class TestGetF0InpF0Splice:
 
         expected_replace = np.interp(np.arange(51), inp_f0[:, 0] * 100, inp_f0[:, 1])[:10]
         np.testing.assert_allclose(f0bak[start:], expected_replace)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline.vc end-to-end smoke test.
+# ---------------------------------------------------------------------------
+#
+# `vc` orchestrates HuBERT + RMVPE + Synthesizer. The individual modules are
+# tested elsewhere; this test stubs HuBERT and RMVPE so the assertion is
+# really about the wiring — input/output shapes line up, the synthesizer
+# receives correctly-shaped phone/pitch/lengths/sid, and the returned audio
+# is 1D at the expected sample count.
+
+
+class _StubHubert:
+    """Stand-in for `HubertModel`. `extract_features` returns a deterministic tensor at `audio_len/downsample`
+    frame rate; that lets the test reason about lengths exactly."""
+
+    def __init__(self, embed_dim: int = 768, downsample: int = 320, seed: int = 0):
+        self.embed_dim = embed_dim
+        self.downsample = downsample
+        self._seed = seed
+
+    def extract_features(self, audio, padding_mask=None, output_layer=None):  # noqa: ARG002
+        B, T_audio = audio.shape
+        T_out = T_audio // self.downsample
+        rng = np.random.default_rng(self._seed)
+        feats_np = rng.standard_normal((B, T_out, self.embed_dim)).astype(np.float32)
+        return mx.array(feats_np)
+
+
+class _FakeConfig:
+    x_pad = 1
+    x_query = 6
+    x_center = 38
+    x_max = 41
+    is_half = False
+    rmvpe_root = "<unused>"
+    hubert_root = "<unused>"
+
+
+# Small synthesizer config, mirroring the one in test_synthesizer.py. The synthesizer is the real module here;
+# only HuBERT and RMVPE are stubbed.
+_PIPELINE_SYNTH_CONFIG = dict(
+    spec_channels=64,
+    segment_size=128,
+    inter_channels=8,
+    hidden_channels=8,
+    filter_channels=16,
+    n_heads=2,
+    n_layers=2,
+    kernel_size=3,
+    p_dropout=0.0,
+    resblock="1",
+    resblock_kernel_sizes=(3, 7),
+    resblock_dilation_sizes=((1, 3, 5), (1, 3, 5)),
+    upsample_rates=(4, 2),
+    upsample_initial_channel=32,
+    upsample_kernel_sizes=(8, 4),
+    spk_embed_dim=4,
+    gin_channels=4,
+    sr=16000,
+)
+
+
+class TestPipelineVc:
+    """Audio in (16 kHz) -> generated audio (synthesizer.sr). Verifies the orchestration shape contract."""
+
+    def test_vc_returns_audio_with_expected_length(self):
+        synthesizer = SynthesizerTrnMs768NSFsid(**_PIPELINE_SYNTH_CONFIG)
+        synthesizer.eval()
+
+        # Audio length 640 = 2 * hubert_hop (320). HuBERT stub produces (1, 2, 768) -> 2x interpolate -> (1, 4, 768).
+        # The RMVPE stub is set up to return 4 frames so the min-length clip leaves T=4.
+        audio_len = 640
+        rng = np.random.default_rng(0)
+        audio = mx.array(rng.standard_normal(audio_len).astype(np.float32))
+        f0_raw = np.array([200.0, 300.0, 400.0, 500.0], dtype=np.float64)
+
+        pipe = Pipeline(
+            tgt_sr=_PIPELINE_SYNTH_CONFIG["sr"],
+            config=_FakeConfig(),
+            rmvpe=_StubRMVPE(f0_raw),
+            hubert=_StubHubert(),
+        )
+        out = pipe.vc(synthesizer, audio, sid=0)
+
+        # 4 frames * prod(upsample_rates)=8 -> 32 audio samples at the synthesizer's sr.
+        upp = int(np.prod(_PIPELINE_SYNTH_CONFIG["upsample_rates"]))
+        expected_len = 4 * upp
+        assert out.ndim == 1
+        assert out.shape[0] == expected_len
+
+    def test_vc_clips_to_shorter_sequence(self):
+        """If HuBERT-derived T_features and the RMVPE-derived T_f0 disagree, the pipeline clips to the shorter."""
+        synthesizer = SynthesizerTrnMs768NSFsid(**_PIPELINE_SYNTH_CONFIG)
+        synthesizer.eval()
+
+        # Audio length 960 -> 3 HuBERT frames -> 6 after 2x interpolate. RMVPE stub returns only 4 frames -> clip to 4.
+        audio_len = 960
+        rng = np.random.default_rng(1)
+        audio = mx.array(rng.standard_normal(audio_len).astype(np.float32))
+        f0_raw = np.array([220.0, 330.0, 440.0, 550.0], dtype=np.float64)
+
+        pipe = Pipeline(
+            tgt_sr=_PIPELINE_SYNTH_CONFIG["sr"],
+            config=_FakeConfig(),
+            rmvpe=_StubRMVPE(f0_raw),
+            hubert=_StubHubert(),
+        )
+        out = pipe.vc(synthesizer, audio, sid=0)
+
+        upp = int(np.prod(_PIPELINE_SYNTH_CONFIG["upsample_rates"]))
+        # min(6, 4) = 4 frames * 8 = 32 samples.
+        assert out.shape[0] == 4 * upp
+
+    def test_vc_rejects_non_1d_audio(self):
+        synthesizer = SynthesizerTrnMs768NSFsid(**_PIPELINE_SYNTH_CONFIG)
+        synthesizer.eval()
+        pipe = Pipeline(
+            tgt_sr=_PIPELINE_SYNTH_CONFIG["sr"],
+            config=_FakeConfig(),
+            rmvpe=_StubRMVPE(np.zeros(4)),
+            hubert=_StubHubert(),
+        )
+        bad_audio = mx.zeros((1, 640))  # 2D — vc only accepts 1D.
+        with pytest.raises(ValueError, match="Expected a 1D audio array"):
+            pipe.vc(synthesizer, bad_audio, sid=0)
 
 
 if __name__ == "__main__":
