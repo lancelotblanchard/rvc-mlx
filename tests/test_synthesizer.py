@@ -16,24 +16,32 @@ import torch
 from rvc_mlx.synthesizer import (
     Encoder,
     FFN,
+    Flip,
     GeneratorNSF,
     LayerNorm,
     MultiHeadAttention,
     ResBlock1,
+    ResidualCouplingBlock,
+    ResidualCouplingLayer,
     SineGen,
     SourceModuleHnNSF,
     TextEncoder768,
+    WN,
 )
 from rvc_mlx._torch_ref import (
     TorchFFN,
+    TorchFlip,
     TorchGeneratorNSF,
     TorchLayerNorm,
     TorchMultiHeadAttention,
     TorchResBlock1,
+    TorchResidualCouplingBlock,
+    TorchResidualCouplingLayer,
     TorchSineGen,
     TorchSourceModuleHnNSF,
     TorchTextEncoder768,
     TorchTransformerEncoder,
+    TorchWN,
 )
 
 from .mlx_torch_comparison_framework import BaseOperationTest, OperationTestSuite
@@ -43,9 +51,12 @@ from .torch_bridge import (
     copy_layer_norm,
     copy_multi_head_attention,
     copy_res_block1,
+    copy_residual_coupling_block,
+    copy_residual_coupling_layer,
     copy_source_module_hn_nsf,
     copy_text_encoder_768,
     copy_transformer_encoder,
+    copy_wn,
     set_eval,
     to_time_first,
     to_time_last,
@@ -923,6 +934,299 @@ class TestSynthesizerGeneratorNSFNoSpeaker(BaseOperationTest):
             description="GeneratorNSF with gin_channels=0 (no speaker conditioning path)",
             atol=1e-3,
             rtol=1e-3,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Flow modules (WN, Flip, ResidualCouplingLayer, ResidualCouplingBlock).
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _build_wn_pair(
+    hidden_channels=64, kernel_size=5, dilation_rate=1, n_layers=3, gin_channels=0, seed=0
+):
+    torch.manual_seed(seed)
+    init = dict(
+        hidden_channels=hidden_channels,
+        kernel_size=kernel_size,
+        dilation_rate=dilation_rate,
+        n_layers=n_layers,
+        gin_channels=gin_channels,
+        p_dropout=0.0,
+    )
+    t_wn = TorchWN(**init)
+    m_wn = WN(**init)
+    copy_wn(t_wn, m_wn)
+    set_eval(t_wn, m_wn)
+
+    def mlx_fn(x, x_mask, g=None):
+        out = m_wn(
+            to_time_last(x),
+            to_time_last(x_mask),
+            g=to_time_last(g) if g is not None else None,
+        )
+        return to_time_first(out)
+
+    def torch_fn(x, x_mask, g=None):
+        with torch.no_grad():
+            return t_wn(x, x_mask, g=g)
+
+    return mlx_fn, torch_fn
+
+
+class TestSynthesizerWNNoCond(BaseOperationTest):
+    """WN without speaker conditioning (cond_layer absent)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_wn_pair(gin_channels=0)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "wn_no_cond")
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 64, 24)).astype(np.float32)
+        mask = np.ones((1, 1, 24), dtype=np.float32)
+        cls.suite.add_test_case(
+            name="wn_no_cond_basic",
+            inputs={"x": x, "x_mask": mask},
+            description="WN forward without speaker conditioning, full mask",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerWNWithCond(BaseOperationTest):
+    """WN with speaker conditioning (`gin_channels != 0`)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_wn_pair(gin_channels=8, seed=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "wn_with_cond")
+
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 64, 24)).astype(np.float32)
+        mask = np.zeros((1, 1, 24), dtype=np.float32)
+        mask[0, 0, :20] = 1.0
+        # Speaker embedding broadcast across time: (B, gin, 1).
+        g = rng.standard_normal((1, 8, 1)).astype(np.float32)
+        cls.suite.add_test_case(
+            name="wn_with_cond_partial_mask",
+            inputs={"x": x, "x_mask": mask, "g": g},
+            description="WN with speaker conditioning broadcast across time, partial mask",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerFlip(BaseOperationTest):
+    """Flip module: reverses channels with no parameters. Tests both forward and reverse modes."""
+
+    @classmethod
+    def setup_class(cls):
+        t_fl = TorchFlip()
+        m_fl = Flip()
+        set_eval(t_fl, m_fl)
+
+        def mlx_fn(x, x_mask, reverse=False):
+            out, _ = m_fl(to_time_last(x), to_time_last(x_mask), reverse=reverse)
+            return to_time_first(out)
+
+        def torch_fn(x, x_mask, reverse=False):
+            with torch.no_grad():
+                out, _ = t_fl(x, x_mask, reverse=reverse)
+            return out
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "flip")
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 8, 12)).astype(np.float32)
+        mask = np.ones((1, 1, 12), dtype=np.float32)
+        cls.suite.add_test_case(
+            name="flip_forward",
+            inputs={"x": x, "x_mask": mask, "reverse": False},
+            description="Flip in forward mode reverses channels",
+            atol=0.0,
+            rtol=0.0,
+        )
+        cls.suite.add_test_case(
+            name="flip_reverse",
+            inputs={"x": x, "x_mask": mask, "reverse": True},
+            description="Flip in reverse mode reverses channels (same result as forward)",
+            atol=0.0,
+            rtol=0.0,
+        )
+
+
+def _build_residual_coupling_layer_pair(
+    channels=8, hidden_channels=16, kernel_size=5, dilation_rate=1, n_layers=2,
+    gin_channels=0, mean_only=False, seed=0,
+):
+    torch.manual_seed(seed)
+    init = dict(
+        channels=channels,
+        hidden_channels=hidden_channels,
+        kernel_size=kernel_size,
+        dilation_rate=dilation_rate,
+        n_layers=n_layers,
+        gin_channels=gin_channels,
+        mean_only=mean_only,
+    )
+    t_rcl = TorchResidualCouplingLayer(**init)
+    # Randomize post weights/biases (the reference zero-inits these, which would make the test compare zeros).
+    with torch.no_grad():
+        t_rcl.post.weight.copy_(torch.randn_like(t_rcl.post.weight) * 0.1)
+        t_rcl.post.bias.copy_(torch.randn_like(t_rcl.post.bias) * 0.1)
+    m_rcl = ResidualCouplingLayer(**init)
+    copy_residual_coupling_layer(t_rcl, m_rcl)
+    set_eval(t_rcl, m_rcl)
+
+    def mlx_fn(x, x_mask, g=None, reverse=False):
+        out, _ = m_rcl(
+            to_time_last(x),
+            to_time_last(x_mask),
+            g=to_time_last(g) if g is not None else None,
+            reverse=reverse,
+        )
+        return to_time_first(out)
+
+    def torch_fn(x, x_mask, g=None, reverse=False):
+        with torch.no_grad():
+            out, _ = t_rcl(x, x_mask, g=g, reverse=reverse)
+        return out
+
+    return mlx_fn, torch_fn
+
+
+class TestSynthesizerResidualCouplingLayerMeanOnly(BaseOperationTest):
+    """`mean_only=True` coupling layer (the variant used inside ResidualCouplingBlock)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_residual_coupling_layer_pair(mean_only=True)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "rcl_mean_only")
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 8, 16)).astype(np.float32)
+        mask = np.ones((1, 1, 16), dtype=np.float32)
+        cls.suite.add_test_case(
+            name="rcl_mean_only_forward",
+            inputs={"x": x, "x_mask": mask, "reverse": False},
+            description="mean_only coupling layer in forward mode",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        cls.suite.add_test_case(
+            name="rcl_mean_only_reverse",
+            inputs={"x": x, "x_mask": mask, "reverse": True},
+            description="mean_only coupling layer in reverse mode (the inference path)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerResidualCouplingLayerWithG(BaseOperationTest):
+    """Coupling layer with speaker conditioning through WN's cond path."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_residual_coupling_layer_pair(
+            gin_channels=4, mean_only=True, seed=1
+        )
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "rcl_with_g")
+
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 8, 12)).astype(np.float32)
+        mask = np.ones((1, 1, 12), dtype=np.float32)
+        g = rng.standard_normal((1, 4, 1)).astype(np.float32)
+        cls.suite.add_test_case(
+            name="rcl_with_g_reverse",
+            inputs={"x": x, "x_mask": mask, "g": g, "reverse": True},
+            description="Coupling layer with speaker conditioning in reverse mode",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def _build_residual_coupling_block_pair(
+    channels=8, hidden_channels=16, kernel_size=5, dilation_rate=1, n_layers=2,
+    n_flows=4, gin_channels=4, seed=0,
+):
+    torch.manual_seed(seed)
+    init = dict(
+        channels=channels,
+        hidden_channels=hidden_channels,
+        kernel_size=kernel_size,
+        dilation_rate=dilation_rate,
+        n_layers=n_layers,
+        n_flows=n_flows,
+        gin_channels=gin_channels,
+    )
+    t_rcb = TorchResidualCouplingBlock(**init)
+    # Randomize post weights inside each coupling layer (default zero-init makes the block a pure identity sequence
+    # of Flips).
+    with torch.no_grad():
+        for flow in t_rcb.flows:
+            if hasattr(flow, "post"):
+                flow.post.weight.copy_(torch.randn_like(flow.post.weight) * 0.1)
+                flow.post.bias.copy_(torch.randn_like(flow.post.bias) * 0.1)
+    m_rcb = ResidualCouplingBlock(**init)
+    copy_residual_coupling_block(t_rcb, m_rcb)
+    set_eval(t_rcb, m_rcb)
+
+    def mlx_fn(x, x_mask, g=None, reverse=False):
+        out = m_rcb(
+            to_time_last(x),
+            to_time_last(x_mask),
+            g=to_time_last(g) if g is not None else None,
+            reverse=reverse,
+        )
+        return to_time_first(out)
+
+    def torch_fn(x, x_mask, g=None, reverse=False):
+        with torch.no_grad():
+            return t_rcb(x, x_mask, g=g, reverse=reverse)
+
+    return mlx_fn, torch_fn
+
+
+class TestSynthesizerResidualCouplingBlockReverse(BaseOperationTest):
+    """The inference path: ResidualCouplingBlock in reverse mode (the only mode RVC actually uses at inference)."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_residual_coupling_block_pair()
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "rcb_reverse")
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((1, 8, 16)).astype(np.float32)
+        mask = np.ones((1, 1, 16), dtype=np.float32)
+        g = rng.standard_normal((1, 4, 1)).astype(np.float32)
+        cls.suite.add_test_case(
+            name="rcb_reverse_full",
+            inputs={"x": x, "x_mask": mask, "g": g, "reverse": True},
+            description="ResidualCouplingBlock reverse pass with 4 flows + speaker conditioning",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerResidualCouplingBlockForward(BaseOperationTest):
+    """ResidualCouplingBlock in forward mode (training path), to round out coverage."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_residual_coupling_block_pair(seed=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "rcb_forward")
+
+        rng = np.random.default_rng(1)
+        x = rng.standard_normal((1, 8, 16)).astype(np.float32)
+        mask = np.ones((1, 1, 16), dtype=np.float32)
+        g = rng.standard_normal((1, 4, 1)).astype(np.float32)
+        cls.suite.add_test_case(
+            name="rcb_forward_full",
+            inputs={"x": x, "x_mask": mask, "g": g, "reverse": False},
+            description="ResidualCouplingBlock forward pass (training path)",
+            atol=1e-4,
+            rtol=1e-4,
         )
 
 

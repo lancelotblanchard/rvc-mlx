@@ -841,3 +841,269 @@ class GeneratorNSF(nn.Module):
         x = self.conv_post(x)
         x = mx.tanh(x)
         return x
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Flow modules (WN, Flip, ResidualCouplingLayer, ResidualCouplingBlock).
+#
+# RVC uses a normalizing-flow stack between the text encoder posterior and the generator. At inference time the block
+# runs in reverse mode, applying the inverse flow to draw `z ~ q(z|condition)`.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _fused_add_tanh_sigmoid_multiply(
+    input_a: mx.array, input_b: mx.array, n_channels: int
+) -> mx.array:
+    """
+    Gated activation: `tanh(left_half(a + b)) * sigmoid(right_half(a + b))`. The "left/right half" split is along the
+    channel axis (which is the last axis in MLX channels-last).
+    """
+    in_act = input_a + input_b
+    t_act = mx.tanh(in_act[..., :n_channels])
+    s_act = mx.sigmoid(in_act[..., n_channels:])
+    return t_act * s_act
+
+
+class WN(nn.Module):
+    """
+    WaveNet-style dilated convolutional block used as the parameter-producing network inside `ResidualCouplingLayer`.
+
+    Each layer:
+      * runs a dilated 1D conv with double the hidden channels (so we have both the tanh and sigmoid halves);
+      * optionally adds a slice of the speaker conditioning (one chunk per layer);
+      * applies the fused tanh-sigmoid gate;
+      * splits a 1x1 "res_skip" conv into a residual (added back into `x`) and a skip (accumulated into `output`).
+        The last layer has no residual half.
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        kernel_size: int,
+        dilation_rate: int,
+        n_layers: int,
+        gin_channels: int = 0,
+        p_dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert kernel_size % 2 == 1, "WN expects odd kernel_size."
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+        self.p_dropout = float(p_dropout)
+
+        self.drop = nn.Dropout(self.p_dropout)
+        self.in_layers: list = []
+        self.res_skip_layers: list = []
+
+        if gin_channels != 0:
+            self.cond_layer = nn.Conv1d(
+                gin_channels, 2 * hidden_channels * n_layers, kernel_size=1
+            )
+
+        for i in range(n_layers):
+            dilation = dilation_rate**i
+            padding = (kernel_size * dilation - dilation) // 2
+            self.in_layers.append(
+                nn.Conv1d(
+                    hidden_channels,
+                    2 * hidden_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    padding=padding,
+                )
+            )
+            res_skip_channels = 2 * hidden_channels if i < n_layers - 1 else hidden_channels
+            self.res_skip_layers.append(
+                nn.Conv1d(hidden_channels, res_skip_channels, kernel_size=1)
+            )
+
+    def __call__(
+        self, x: mx.array, x_mask: mx.array, g: Optional[mx.array] = None
+    ) -> mx.array:
+        # x: (B, T, hidden_channels); x_mask: (B, T, 1); g: (B, T_g, gin_channels) or None.
+        output = mx.zeros_like(x)
+
+        if g is not None:
+            g = self.cond_layer(g)  # (B, T_g, 2 * hidden * n_layers)
+
+        for i in range(self.n_layers):
+            x_in = self.in_layers[i](x)  # (B, T, 2 * hidden)
+            if g is not None:
+                cond_offset = i * 2 * self.hidden_channels
+                g_l = g[..., cond_offset : cond_offset + 2 * self.hidden_channels]
+            else:
+                g_l = mx.zeros_like(x_in)
+
+            acts = _fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)
+            acts = self.drop(acts)
+
+            res_skip_acts = self.res_skip_layers[i](acts)
+            if i < self.n_layers - 1:
+                res_acts = res_skip_acts[..., : self.hidden_channels]
+                x = (x + res_acts) * x_mask
+                output = output + res_skip_acts[..., self.hidden_channels :]
+            else:
+                output = output + res_skip_acts
+        return output * x_mask
+
+
+class Flip(nn.Module):
+    """
+    Channel-axis flip used between coupling layers so consecutive layers transform the other half of the input.
+    Carries no parameters. In `reverse=False` mode returns `(x_flipped, logdet=zeros(B,))`; in `reverse=True` mode
+    returns `(x_flipped, zeros(1))` to match the RVC reference contract.
+    """
+
+    def __call__(
+        self,
+        x: mx.array,
+        x_mask: mx.array,
+        g: Optional[mx.array] = None,
+        reverse: bool = False,
+    ) -> Tuple[mx.array, mx.array]:
+        # Channel axis is last in MLX channels-last.
+        x = x[..., ::-1]
+        if not reverse:
+            logdet = mx.zeros((x.shape[0],), dtype=x.dtype)
+            return x, logdet
+        return x, mx.zeros((1,))
+
+
+class ResidualCouplingLayer(nn.Module):
+    """
+    Affine coupling layer: splits `x` into two halves along the channel axis, transforms one half conditioned on the
+    other via the parameter network `enc` (a `WN`), and concatenates them back. With `mean_only=True` the affine is a
+    pure shift (logs == 0) — this is the variant used by `ResidualCouplingBlock` in RVC's synthesizer.
+
+    Inference uses `reverse=True`: the inverse transformation `x1 = (x1 - m) * exp(-logs) * x_mask`.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        dilation_rate: int,
+        n_layers: int,
+        p_dropout: float = 0.0,
+        gin_channels: int = 0,
+        mean_only: bool = False,
+    ):
+        super().__init__()
+        assert channels % 2 == 0, "channels must be divisible by 2."
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = nn.Conv1d(self.half_channels, hidden_channels, kernel_size=1)
+        self.enc = WN(
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            p_dropout=float(p_dropout),
+            gin_channels=gin_channels,
+        )
+        # The reference zero-initializes both `post.weight` and `post.bias`. We follow suit so a freshly built module
+        # is the identity transformation at the affine step (m == 0, logs == 0). Tests that compare against the torch
+        # ref bypass this by copying weights across.
+        self.post = nn.Conv1d(
+            hidden_channels, self.half_channels * (2 - int(mean_only)), kernel_size=1
+        )
+        self.post.weight = mx.zeros_like(self.post.weight)
+        if self.post.bias is not None:
+            self.post.bias = mx.zeros_like(self.post.bias)
+
+    def __call__(
+        self,
+        x: mx.array,
+        x_mask: mx.array,
+        g: Optional[mx.array] = None,
+        reverse: bool = False,
+    ) -> Tuple[mx.array, mx.array]:
+        # x: (B, T, channels); split along channel axis.
+        x0 = x[..., : self.half_channels]
+        x1 = x[..., self.half_channels :]
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+        if not self.mean_only:
+            m = stats[..., : self.half_channels]
+            logs = stats[..., self.half_channels :]
+        else:
+            m = stats
+            logs = mx.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * mx.exp(logs) * x_mask
+            x = mx.concatenate([x0, x1], axis=-1)
+            # logdet summed over the time + channel axes (axes 1 and 2 in channels-last).
+            logdet = mx.sum(logs, axis=(1, 2))
+            return x, logdet
+        x1 = (x1 - m) * mx.exp(-logs) * x_mask
+        x = mx.concatenate([x0, x1], axis=-1)
+        return x, mx.zeros((1,))
+
+
+class ResidualCouplingBlock(nn.Module):
+    """
+    Stack of `n_flows` `ResidualCouplingLayer` modules (always `mean_only=True`) interleaved with `Flip`s. At inference
+    time the block is applied in reverse: it consumes `z_p ~ N(m_p, exp(logs_p))` from the text encoder posterior and
+    produces `z` that conditions the generator.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int,
+        kernel_size: int,
+        dilation_rate: int,
+        n_layers: int,
+        n_flows: int = 4,
+        gin_channels: int = 0,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows: list = []
+        for _ in range(n_flows):
+            self.flows.append(
+                ResidualCouplingLayer(
+                    channels,
+                    hidden_channels,
+                    kernel_size,
+                    dilation_rate,
+                    n_layers,
+                    gin_channels=gin_channels,
+                    mean_only=True,
+                )
+            )
+            self.flows.append(Flip())
+
+    def __call__(
+        self,
+        x: mx.array,
+        x_mask: mx.array,
+        g: Optional[mx.array] = None,
+        reverse: bool = False,
+    ) -> mx.array:
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in self.flows[::-1]:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        return x

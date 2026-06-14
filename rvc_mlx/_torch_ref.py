@@ -861,3 +861,201 @@ class TorchGeneratorNSF(torch.nn.Module):
         x = self.conv_post(x)
         x = torch.tanh(x)
         return x
+
+
+def _torch_fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
+    n_channels_int = n_channels[0]
+    in_act = input_a + input_b
+    t_act = torch.tanh(in_act[:, :n_channels_int, :])
+    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    return t_act * s_act
+
+
+class TorchWN(torch.nn.Module):
+    """PyTorch reference for the WN gated dilated-conv stack. Plain Conv1d (no `weight_norm`) for parity with our MLX
+    impl, which assumes fused weights from `remove_weight_norm()`."""
+
+    def __init__(
+        self,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        gin_channels=0,
+        p_dropout=0,
+    ):
+        super().__init__()
+        assert kernel_size % 2 == 1
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+        self.p_dropout = float(p_dropout)
+
+        self.drop = torch.nn.Dropout(self.p_dropout)
+        self.in_layers = torch.nn.ModuleList()
+        self.res_skip_layers = torch.nn.ModuleList()
+
+        if gin_channels != 0:
+            self.cond_layer = torch.nn.Conv1d(
+                gin_channels, 2 * hidden_channels * n_layers, 1
+            )
+
+        for i in range(n_layers):
+            dilation = dilation_rate**i
+            padding = int((kernel_size * dilation - dilation) / 2)
+            self.in_layers.append(
+                torch.nn.Conv1d(
+                    hidden_channels,
+                    2 * hidden_channels,
+                    kernel_size,
+                    dilation=dilation,
+                    padding=padding,
+                )
+            )
+            res_skip_channels = 2 * hidden_channels if i < n_layers - 1 else hidden_channels
+            self.res_skip_layers.append(
+                torch.nn.Conv1d(hidden_channels, res_skip_channels, 1)
+            )
+
+    def forward(self, x, x_mask, g=None):
+        output = torch.zeros_like(x)
+        n_channels_tensor = torch.IntTensor([self.hidden_channels])
+
+        if g is not None:
+            g = self.cond_layer(g)
+
+        for i, (in_layer, res_skip_layer) in enumerate(
+            zip(self.in_layers, self.res_skip_layers)
+        ):
+            x_in = in_layer(x)
+            if g is not None:
+                cond_offset = i * 2 * self.hidden_channels
+                g_l = g[:, cond_offset : cond_offset + 2 * self.hidden_channels, :]
+            else:
+                g_l = torch.zeros_like(x_in)
+
+            acts = _torch_fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
+            acts = self.drop(acts)
+
+            res_skip_acts = res_skip_layer(acts)
+            if i < self.n_layers - 1:
+                res_acts = res_skip_acts[:, : self.hidden_channels, :]
+                x = (x + res_acts) * x_mask
+                output = output + res_skip_acts[:, self.hidden_channels :, :]
+            else:
+                output = output + res_skip_acts
+        return output * x_mask
+
+
+class TorchFlip(torch.nn.Module):
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x = torch.flip(x, [1])
+        if not reverse:
+            logdet = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+            return x, logdet
+        return x, torch.zeros([1])
+
+
+class TorchResidualCouplingLayer(torch.nn.Module):
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        p_dropout=0,
+        gin_channels=0,
+        mean_only=False,
+    ):
+        super().__init__()
+        assert channels % 2 == 0
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.half_channels = channels // 2
+        self.mean_only = mean_only
+
+        self.pre = torch.nn.Conv1d(self.half_channels, hidden_channels, 1)
+        self.enc = TorchWN(
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            p_dropout=float(p_dropout),
+            gin_channels=gin_channels,
+        )
+        self.post = torch.nn.Conv1d(
+            hidden_channels, self.half_channels * (2 - int(mean_only)), 1
+        )
+        self.post.weight.data.zero_()
+        self.post.bias.data.zero_()
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
+        h = self.pre(x0) * x_mask
+        h = self.enc(h, x_mask, g=g)
+        stats = self.post(h) * x_mask
+        if not self.mean_only:
+            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
+        else:
+            m = stats
+            logs = torch.zeros_like(m)
+
+        if not reverse:
+            x1 = m + x1 * torch.exp(logs) * x_mask
+            x = torch.cat([x0, x1], 1)
+            logdet = torch.sum(logs, [1, 2])
+            return x, logdet
+        x1 = (x1 - m) * torch.exp(-logs) * x_mask
+        x = torch.cat([x0, x1], 1)
+        return x, torch.zeros([1])
+
+
+class TorchResidualCouplingBlock(torch.nn.Module):
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        n_flows=4,
+        gin_channels=0,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows = torch.nn.ModuleList()
+        for _ in range(n_flows):
+            self.flows.append(
+                TorchResidualCouplingLayer(
+                    channels,
+                    hidden_channels,
+                    kernel_size,
+                    dilation_rate,
+                    n_layers,
+                    gin_channels=gin_channels,
+                    mean_only=True,
+                )
+            )
+            self.flows.append(TorchFlip())
+
+    def forward(self, x, x_mask, g=None, reverse=False):
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in self.flows[::-1]:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        return x

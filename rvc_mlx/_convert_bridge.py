@@ -346,6 +346,31 @@ def copy_res_block1(torch_rb, mlx_rb) -> None:
         copy_conv1d(tc, mc)
 
 
+def copy_wn(torch_wn, mlx_wn) -> None:
+    """Copy `WN`: parallel stacks of input dilated convs + residual-skip 1x1 convs, plus the optional cond Conv1d."""
+    for t_in, m_in in zip(torch_wn.in_layers, mlx_wn.in_layers):
+        copy_conv1d(t_in, m_in)
+    for t_rs, m_rs in zip(torch_wn.res_skip_layers, mlx_wn.res_skip_layers):
+        copy_conv1d(t_rs, m_rs)
+    if torch_wn.gin_channels != 0:
+        copy_conv1d(torch_wn.cond_layer, mlx_wn.cond_layer)
+
+
+def copy_residual_coupling_layer(torch_rcl, mlx_rcl) -> None:
+    """Copy `ResidualCouplingLayer`: pre Conv1d + WN parameter network + post Conv1d."""
+    copy_conv1d(torch_rcl.pre, mlx_rcl.pre)
+    copy_wn(torch_rcl.enc, mlx_rcl.enc)
+    copy_conv1d(torch_rcl.post, mlx_rcl.post)
+
+
+def copy_residual_coupling_block(torch_rcb, mlx_rcb) -> None:
+    """Copy `ResidualCouplingBlock`: alternating `ResidualCouplingLayer` + `Flip`s (Flip has no params)."""
+    for t_flow, m_flow in zip(torch_rcb.flows, mlx_rcb.flows):
+        # Even indices are coupling layers (with weights); odd indices are Flip (parameter-free).
+        if hasattr(t_flow, "pre"):
+            copy_residual_coupling_layer(t_flow, m_flow)
+
+
 def copy_generator_nsf(torch_gen, mlx_gen) -> None:
     """
     Copy `GeneratorNSF`: source module + pre Conv + upsampling ConvTranspose + noise Conv + ResBlock stacks + post Conv
