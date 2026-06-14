@@ -16,16 +16,20 @@ import torch
 from rvc_mlx.synthesizer import (
     Encoder,
     FFN,
+    GeneratorNSF,
     LayerNorm,
     MultiHeadAttention,
+    ResBlock1,
     SineGen,
     SourceModuleHnNSF,
     TextEncoder768,
 )
 from rvc_mlx._torch_ref import (
     TorchFFN,
+    TorchGeneratorNSF,
     TorchLayerNorm,
     TorchMultiHeadAttention,
+    TorchResBlock1,
     TorchSineGen,
     TorchSourceModuleHnNSF,
     TorchTextEncoder768,
@@ -35,8 +39,10 @@ from rvc_mlx._torch_ref import (
 from .mlx_torch_comparison_framework import BaseOperationTest, OperationTestSuite
 from .torch_bridge import (
     copy_ffn,
+    copy_generator_nsf,
     copy_layer_norm,
     copy_multi_head_attention,
+    copy_res_block1,
     copy_source_module_hn_nsf,
     copy_text_encoder_768,
     copy_transformer_encoder,
@@ -734,6 +740,189 @@ class TestSynthesizerSourceModuleHarmonics(BaseOperationTest):
             description="Source module with 2 harmonics (dim=3 -> Linear projects to 1 channel)",
             atol=1e-4,
             rtol=1e-4,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ResBlock1 and GeneratorNSF.
+#
+# Both wrap several Conv1d / ConvTranspose1d layers and have no internal randomness, so paired-module testing is
+# straightforward once weights are copied.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _build_res_block1_pair(channels=32, kernel_size=3, dilation=(1, 3, 5), seed=0):
+    torch.manual_seed(seed)
+    t_rb = TorchResBlock1(channels, kernel_size, dilation)
+    m_rb = ResBlock1(channels, kernel_size, dilation)
+    copy_res_block1(t_rb, m_rb)
+    set_eval(t_rb, m_rb)
+
+    def mlx_fn(x, x_mask=None):
+        out = m_rb(to_time_last(x), to_time_last(x_mask) if x_mask is not None else None)
+        return to_time_first(out)
+
+    def torch_fn(x, x_mask=None):
+        with torch.no_grad():
+            return t_rb(x, x_mask)
+
+    return mlx_fn, torch_fn
+
+
+class TestSynthesizerResBlock1Default(BaseOperationTest):
+    """ResBlock1 with the RVC default (kernel=3, dilations=(1, 3, 5))."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_res_block1_pair(channels=32)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "resblock1_default")
+
+        rng = np.random.default_rng(0)
+        cls.suite.add_test_case(
+            name="resblock1_no_mask",
+            inputs={"x": rng.standard_normal((1, 32, 24)).astype(np.float32)},
+            description="Default ResBlock1, no mask",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+        x = rng.standard_normal((2, 32, 24)).astype(np.float32)
+        mask = np.zeros((2, 1, 24), dtype=np.float32)
+        mask[0, 0, :24] = 1.0
+        mask[1, 0, :18] = 1.0
+        cls.suite.add_test_case(
+            name="resblock1_partial_mask",
+            inputs={"x": x, "x_mask": mask},
+            description="ResBlock1 with partial mask zeroing the trailing frames of the second batch entry",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+class TestSynthesizerResBlock1K7(BaseOperationTest):
+    """ResBlock1 with kernel=7, exercising larger dilated receptive fields."""
+
+    @classmethod
+    def setup_class(cls):
+        mlx_fn, torch_fn = _build_res_block1_pair(channels=16, kernel_size=7, dilation=(1, 3, 5), seed=1)
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "resblock1_k7")
+
+        rng = np.random.default_rng(1)
+        cls.suite.add_test_case(
+            name="resblock1_k7_no_mask",
+            inputs={"x": rng.standard_normal((1, 16, 32)).astype(np.float32)},
+            description="ResBlock1 with kernel=7 dilations (1, 3, 5)",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+# Minimal NSF generator config for tests. The real RVC defaults (initial_channel=192, upsample_initial_channel=512,
+# upsample_rates=[10, 10, 2, 2]) are too large for quick CI tests; this scaled-down config still exercises every code
+# path (multi-level upsampling, multi-kernel ResBlock, optional speaker conditioning).
+_GEN_TEST_CONFIG = dict(
+    initial_channel=8,
+    resblock="1",
+    resblock_kernel_sizes=(3, 7),
+    resblock_dilation_sizes=((1, 3, 5), (1, 3, 5)),
+    upsample_rates=(4, 2),
+    upsample_initial_channel=32,
+    upsample_kernel_sizes=(8, 4),
+    gin_channels=4,
+    sr=16000,
+    is_half=False,
+)
+
+
+def _build_generator_nsf_pair(seed=0, **overrides):
+    config = {**_GEN_TEST_CONFIG, **overrides}
+    torch.manual_seed(seed)
+    t_gen = TorchGeneratorNSF(**config)
+    m_gen = GeneratorNSF(**config)
+    copy_generator_nsf(t_gen, m_gen)
+    set_eval(t_gen, m_gen)
+
+    upp = int(np.prod(config["upsample_rates"]))
+    return t_gen, m_gen, config, upp
+
+
+def _generator_inputs(batch, T, initial_channel, gin_channels, upp, rng):
+    """Build (x, f0, g, rand_ini, noise_raw) for the generator test."""
+    x = rng.standard_normal((batch, initial_channel, T)).astype(np.float32)
+    f0 = rng.uniform(50.0, 500.0, size=(batch, T)).astype(np.float32)
+    f0[:, -2:] = 0.0  # last frames unvoiced
+    g = rng.standard_normal((batch, gin_channels, 1)).astype(np.float32)
+    rand_ini = rng.uniform(size=(batch, 1)).astype(np.float32)  # dim == harmonic_num + 1 = 1
+    noise_raw = rng.standard_normal((batch, T * upp, 1)).astype(np.float32)
+    return x, f0, g, rand_ini, noise_raw
+
+
+class TestSynthesizerGeneratorNSFWithSpeaker(BaseOperationTest):
+    """GeneratorNSF with non-zero gin_channels (i.e., with speaker conditioning)."""
+
+    @classmethod
+    def setup_class(cls):
+        t_gen, m_gen, config, upp = _build_generator_nsf_pair()
+
+        def mlx_fn(x, f0, g, rand_ini, noise_raw):
+            # x: (B, C, T) -> (B, T, C); g: (B, gin, 1) -> (B, 1, gin)
+            out = m_gen(
+                to_time_last(x),
+                f0,
+                g=to_time_last(g),
+                rand_ini=rand_ini,
+                noise_raw=noise_raw,
+            )
+            # out: (B, T_audio, 1) -> (B, 1, T_audio)
+            return to_time_first(out)
+
+        def torch_fn(x, f0, g, rand_ini, noise_raw):
+            with torch.no_grad():
+                return t_gen(x, f0, g=g, rand_ini=rand_ini, noise_raw=noise_raw)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "generator_nsf_with_g")
+
+        rng = np.random.default_rng(0)
+        x, f0, g, rand_ini, noise_raw = _generator_inputs(
+            batch=1, T=8, initial_channel=config["initial_channel"], gin_channels=config["gin_channels"], upp=upp, rng=rng
+        )
+        cls.suite.add_test_case(
+            name="generator_with_speaker",
+            inputs={"x": x, "f0": f0, "g": g, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="GeneratorNSF with 2-level upsampling (4x, 2x), 2 parallel ResBlocks per level, with speaker g",
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+class TestSynthesizerGeneratorNSFNoSpeaker(BaseOperationTest):
+    """GeneratorNSF with gin_channels=0 (no speaker conditioning; cond layer is absent)."""
+
+    @classmethod
+    def setup_class(cls):
+        t_gen, m_gen, config, upp = _build_generator_nsf_pair(seed=1, gin_channels=0)
+
+        def mlx_fn(x, f0, rand_ini, noise_raw):
+            out = m_gen(to_time_last(x), f0, rand_ini=rand_ini, noise_raw=noise_raw)
+            return to_time_first(out)
+
+        def torch_fn(x, f0, rand_ini, noise_raw):
+            with torch.no_grad():
+                return t_gen(x, f0, rand_ini=rand_ini, noise_raw=noise_raw)
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "generator_nsf_no_g")
+
+        rng = np.random.default_rng(2)
+        # gin_channels=0 so no g.
+        x, f0, _g, rand_ini, noise_raw = _generator_inputs(
+            batch=1, T=8, initial_channel=config["initial_channel"], gin_channels=1, upp=upp, rng=rng
+        )
+        cls.suite.add_test_case(
+            name="generator_no_speaker",
+            inputs={"x": x, "f0": f0, "rand_ini": rand_ini, "noise_raw": noise_raw},
+            description="GeneratorNSF with gin_channels=0 (no speaker conditioning path)",
+            atol=1e-3,
+            rtol=1e-3,
         )
 
 

@@ -714,3 +714,150 @@ class TorchSourceModuleHnNSF(torch.nn.Module):
         sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         return sine_merge, None, None
+
+
+def _torch_get_padding(kernel_size, dilation=1):
+    return (kernel_size * dilation - dilation) // 2
+
+
+class TorchResBlock1(torch.nn.Module):
+    """PyTorch reference for ResBlock1. The original RVC source wraps each Conv1d in `weight_norm`; this reference uses
+    plain Conv1d so the paired-module test compares fused (post-`remove_weight_norm`) weights."""
+
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dilation = tuple(dilation)
+        self.lrelu_slope = 0.1
+        self.convs1 = torch.nn.ModuleList(
+            [
+                torch.nn.Conv1d(
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=d,
+                    padding=_torch_get_padding(kernel_size, d),
+                )
+                for d in self.dilation
+            ]
+        )
+        self.convs2 = torch.nn.ModuleList(
+            [
+                torch.nn.Conv1d(
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=1,
+                    padding=_torch_get_padding(kernel_size, 1),
+                )
+                for _ in self.dilation
+            ]
+        )
+
+    def forward(self, x, x_mask=None):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = torch.nn.functional.leaky_relu(x, self.lrelu_slope)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c1(xt)
+            xt = torch.nn.functional.leaky_relu(xt, self.lrelu_slope)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c2(xt)
+            x = xt + x
+        if x_mask is not None:
+            x = x * x_mask
+        return x
+
+
+class TorchGeneratorNSF(torch.nn.Module):
+    """PyTorch reference for GeneratorNSF (fused-weight variant; no weight_norm)."""
+
+    def __init__(
+        self,
+        initial_channel,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        gin_channels,
+        sr,
+        is_half=False,
+    ):
+        super().__init__()
+        import math as _math
+        assert resblock == "1", "Only ResBlock1 is supported."
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+        self.upsample_rates = tuple(upsample_rates)
+        self.upp = _math.prod(upsample_rates)
+        self.gin_channels = gin_channels
+        self.lrelu_slope = 0.1
+
+        self.m_source = TorchSourceModuleHnNSF(sampling_rate=sr, harmonic_num=0, is_half=is_half)
+        self.conv_pre = torch.nn.Conv1d(
+            initial_channel, upsample_initial_channel, 7, 1, padding=3
+        )
+
+        self.ups = torch.nn.ModuleList()
+        self.noise_convs = torch.nn.ModuleList()
+        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            in_ch = upsample_initial_channel // (2**i)
+            out_ch = upsample_initial_channel // (2 ** (i + 1))
+            self.ups.append(
+                torch.nn.ConvTranspose1d(in_ch, out_ch, k, u, padding=(k - u) // 2)
+            )
+            if i + 1 < len(upsample_rates):
+                stride_f0 = _math.prod(upsample_rates[i + 1 :])
+                self.noise_convs.append(
+                    torch.nn.Conv1d(
+                        1,
+                        out_ch,
+                        kernel_size=stride_f0 * 2,
+                        stride=stride_f0,
+                        padding=stride_f0 // 2,
+                    )
+                )
+            else:
+                self.noise_convs.append(torch.nn.Conv1d(1, out_ch, kernel_size=1))
+
+        self.resblocks = torch.nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2 ** (i + 1))
+            for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes):
+                self.resblocks.append(TorchResBlock1(ch, k, tuple(d)))
+
+        final_ch = upsample_initial_channel // (2 ** len(upsample_rates))
+        self.conv_post = torch.nn.Conv1d(final_ch, 1, 7, 1, padding=3, bias=False)
+
+        if gin_channels != 0:
+            self.cond = torch.nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+
+    def forward(self, x, f0, g=None, rand_ini=None, noise_raw=None):
+        har_source, _, _ = self.m_source(f0, self.upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        har_source = har_source.transpose(1, 2)  # (B, T*upp, 1) -> (B, 1, T*upp) channels-first
+        x = self.conv_pre(x)
+        if g is not None:
+            x = x + self.cond(g)
+
+        for i in range(self.num_upsamples):
+            x = torch.nn.functional.leaky_relu(x, self.lrelu_slope)
+            x = self.ups[i](x)
+            x_source = self.noise_convs[i](har_source)
+            x = x + x_source
+            block_start = i * self.num_kernels
+            xs = None
+            for j in range(self.num_kernels):
+                rb_out = self.resblocks[block_start + j](x)
+                xs = rb_out if xs is None else xs + rb_out
+            x = xs / self.num_kernels
+
+        x = torch.nn.functional.leaky_relu(x)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+        return x

@@ -639,3 +639,205 @@ class SourceModuleHnNSF(nn.Module):
         # implicit. We still match the reference's return shape `(sine_merge, None, None)` for API compatibility.
         sine_merge = mx.tanh(self.l_linear(sine_wavs))
         return sine_merge, None, None
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# NSF generator (ResBlock1, GeneratorNSF).
+#
+# `ResBlock1` is the HiFi-GAN-style residual block used inside the generator. The PyTorch reference wraps each Conv1d
+# in `weight_norm` for training; the released RVC checkpoints have weight_norm fused back into plain weights via
+# `remove_weight_norm()` before export, so the MLX side uses plain `nn.Conv1d`. The same applies to `GeneratorNSF.ups`
+# (ConvTranspose1d).
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+def _get_padding(kernel_size: int, dilation: int = 1) -> int:
+    """Same-length padding for a 1D conv: `(kernel * dilation - dilation) // 2`. Matches RVC's `get_padding`."""
+    return (kernel_size * dilation - dilation) // 2
+
+
+class ResBlock1(nn.Module):
+    """
+    HiFi-GAN-style residual block with three (Conv1d -> LeakyReLU -> Conv1d -> add) stages. The first conv in each
+    stage uses one of the configured dilations; the second uses dilation=1. Padding is set so each conv preserves the
+    time length.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        dilation: Tuple[int, int, int] = (1, 3, 5),
+    ):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dilation = tuple(dilation)
+        self.lrelu_slope = 0.1
+        self.convs1 = [
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                stride=1,
+                dilation=d,
+                padding=_get_padding(kernel_size, d),
+            )
+            for d in self.dilation
+        ]
+        self.convs2 = [
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                stride=1,
+                dilation=1,
+                padding=_get_padding(kernel_size, 1),
+            )
+            for _ in self.dilation
+        ]
+
+    def __call__(self, x: mx.array, x_mask: Optional[mx.array] = None) -> mx.array:
+        # x: (B, T, C); x_mask: (B, T, 1) or None
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = nn.leaky_relu(x, self.lrelu_slope)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c1(xt)
+            xt = nn.leaky_relu(xt, self.lrelu_slope)
+            if x_mask is not None:
+                xt = xt * x_mask
+            xt = c2(xt)
+            x = xt + x
+        if x_mask is not None:
+            x = x * x_mask
+        return x
+
+
+class GeneratorNSF(nn.Module):
+    """
+    Neural Source-Filter generator. Consumes a per-frame latent `x` plus a per-frame fundamental frequency `f0` and an
+    optional speaker conditioning `g`, and produces audio samples at `T * prod(upsample_rates)` rate.
+
+    Pipeline (channels-last MLX shapes):
+      * `m_source(f0, upp)` -> harmonic excitation `(B, T * upp, 1)`
+      * `conv_pre(x)` -> `(B, T, upsample_initial_channel)`
+      * For each upsampling level i:
+          - LeakyReLU + ConvTranspose1d to multiply time by `upsample_rates[i]`
+          - Add `noise_convs[i](har_source)` (har_source pooled to match the current time length)
+          - Sum-and-average over `num_kernels` parallel `ResBlock1`s
+      * Final LeakyReLU + 7x1 Conv + tanh -> `(B, T_audio, 1)`
+
+    Only `resblock="1"` (ResBlock1) is supported; the alternative ResBlock2 isn't used by the released RVC models.
+    """
+
+    def __init__(
+        self,
+        initial_channel: int,
+        resblock: str,
+        resblock_kernel_sizes: Tuple[int, ...],
+        resblock_dilation_sizes: Tuple[Tuple[int, ...], ...],
+        upsample_rates: Tuple[int, ...],
+        upsample_initial_channel: int,
+        upsample_kernel_sizes: Tuple[int, ...],
+        gin_channels: int,
+        sr: int,
+        is_half: bool = False,
+    ):
+        super().__init__()
+        if resblock != "1":
+            raise NotImplementedError("Only ResBlock1 ('1') is supported for the NSF generator.")
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+        self.upsample_rates = tuple(upsample_rates)
+        self.upp = math.prod(upsample_rates)
+        self.gin_channels = gin_channels
+        self.lrelu_slope = 0.1
+
+        self.m_source = SourceModuleHnNSF(sampling_rate=sr, harmonic_num=0, is_half=is_half)
+        # 7x1 input projection from initial_channel to upsample_initial_channel.
+        self.conv_pre = nn.Conv1d(
+            initial_channel, upsample_initial_channel, kernel_size=7, stride=1, padding=3
+        )
+
+        self.ups: list = []
+        self.noise_convs: list = []
+        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            in_ch = upsample_initial_channel // (2**i)
+            out_ch = upsample_initial_channel // (2 ** (i + 1))
+            self.ups.append(
+                nn.ConvTranspose1d(
+                    in_ch,
+                    out_ch,
+                    kernel_size=k,
+                    stride=u,
+                    padding=(k - u) // 2,
+                )
+            )
+            if i + 1 < len(upsample_rates):
+                # `stride_f0` is the time-compression factor needed so the noise channel matches the current x length.
+                stride_f0 = math.prod(upsample_rates[i + 1 :])
+                self.noise_convs.append(
+                    nn.Conv1d(
+                        1,
+                        out_ch,
+                        kernel_size=stride_f0 * 2,
+                        stride=stride_f0,
+                        padding=stride_f0 // 2,
+                    )
+                )
+            else:
+                # At the last layer the noise source already matches the audio rate; a 1x1 conv is enough.
+                self.noise_convs.append(nn.Conv1d(1, out_ch, kernel_size=1))
+
+        # `resblocks` is a flat list of length `num_upsamples * num_kernels`; level i uses indices
+        # [i * num_kernels, (i + 1) * num_kernels).
+        self.resblocks: list = []
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2 ** (i + 1))
+            for k, d in zip(resblock_kernel_sizes, resblock_dilation_sizes):
+                self.resblocks.append(ResBlock1(ch, k, tuple(d)))
+
+        final_ch = upsample_initial_channel // (2 ** len(upsample_rates))
+        self.conv_post = nn.Conv1d(
+            final_ch, 1, kernel_size=7, stride=1, padding=3, bias=False
+        )
+
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, kernel_size=1)
+
+    def __call__(
+        self,
+        x: mx.array,
+        f0: mx.array,
+        g: Optional[mx.array] = None,
+        rand_ini: Optional[mx.array] = None,
+        noise_raw: Optional[mx.array] = None,
+    ) -> mx.array:
+        # x: (B, T, initial_channel); f0: (B, T); g: (B, 1, gin_channels) or None
+        har_source, _, _ = self.m_source(f0, self.upp, rand_ini=rand_ini, noise_raw=noise_raw)
+        # har_source is already (B, T * upp, 1) in channels-last, which is what the noise_convs Conv1d consumes.
+
+        x = self.conv_pre(x)
+        if g is not None:
+            x = x + self.cond(g)
+
+        for i in range(self.num_upsamples):
+            x = nn.leaky_relu(x, self.lrelu_slope)
+            x = self.ups[i](x)
+            x_source = self.noise_convs[i](har_source)
+            x = x + x_source
+
+            # Sum-and-average over the parallel ResBlock1s at this level. The `xs is None` branch is the first one;
+            # subsequent iterations accumulate.
+            block_start = i * self.num_kernels
+            xs = None
+            for j in range(self.num_kernels):
+                rb_out = self.resblocks[block_start + j](x)
+                xs = rb_out if xs is None else xs + rb_out
+            x = xs / self.num_kernels
+
+        x = nn.leaky_relu(x)
+        x = self.conv_post(x)
+        x = mx.tanh(x)
+        return x

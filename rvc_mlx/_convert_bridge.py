@@ -327,6 +327,43 @@ def copy_source_module_hn_nsf(torch_sm, mlx_sm) -> None:
     copy_linear(torch_sm.l_linear, mlx_sm.l_linear)
 
 
+def copy_conv_transpose1d(torch_conv, mlx_conv) -> None:
+    """
+    PyTorch ConvTranspose1d weight shape: `(in_channels, out_channels // groups, kernel_size)`
+    MLX     ConvTranspose1d weight shape: `(out_channels, kernel_size, in_channels // groups)`
+    """
+    w = torch_conv.weight.detach().cpu().numpy().transpose(1, 2, 0)
+    mlx_conv.weight = mx.array(w)
+    if torch_conv.bias is not None:
+        mlx_conv.bias = _to_mx(torch_conv.bias)
+
+
+def copy_res_block1(torch_rb, mlx_rb) -> None:
+    """Copy a `ResBlock1`: two parallel stacks of three Conv1d each."""
+    for tc, mc in zip(torch_rb.convs1, mlx_rb.convs1):
+        copy_conv1d(tc, mc)
+    for tc, mc in zip(torch_rb.convs2, mlx_rb.convs2):
+        copy_conv1d(tc, mc)
+
+
+def copy_generator_nsf(torch_gen, mlx_gen) -> None:
+    """
+    Copy `GeneratorNSF`: source module + pre Conv + upsampling ConvTranspose + noise Conv + ResBlock stacks + post Conv
+    + optional speaker conditioning Conv.
+    """
+    copy_source_module_hn_nsf(torch_gen.m_source, mlx_gen.m_source)
+    copy_conv1d(torch_gen.conv_pre, mlx_gen.conv_pre)
+    for t_up, m_up in zip(torch_gen.ups, mlx_gen.ups):
+        copy_conv_transpose1d(t_up, m_up)
+    for t_nc, m_nc in zip(torch_gen.noise_convs, mlx_gen.noise_convs):
+        copy_conv1d(t_nc, m_nc)
+    for t_rb, m_rb in zip(torch_gen.resblocks, mlx_gen.resblocks):
+        copy_res_block1(t_rb, m_rb)
+    copy_conv1d(torch_gen.conv_post, mlx_gen.conv_post)
+    if torch_gen.gin_channels != 0:
+        copy_conv1d(torch_gen.cond, mlx_gen.cond)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:
