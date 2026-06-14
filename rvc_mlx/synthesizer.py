@@ -1107,3 +1107,156 @@ class ResidualCouplingBlock(nn.Module):
             for flow in self.flows[::-1]:
                 x, _ = flow(x, x_mask, g=g, reverse=reverse)
         return x
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Top-level synthesizer (inference path only).
+#
+# `SynthesizerTrnMs768NSFsid` chains the four learned components used at inference: text encoder, normalizing flow,
+# generator, and speaker-embedding lookup. The training-time posterior encoder (`enc_q` in the reference) is omitted
+# here — it's not used at inference and would need extra plumbing.
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+# Standard noise temperature used by the RVC reference when sampling from the text-encoder posterior. Hard-coded to
+# match the published implementation; not part of the learned config.
+_INFER_NOISE_SCALE = 0.66666
+
+
+class SynthesizerTrnMs768NSFsid(nn.Module):
+    """
+    The released RVC voice-conversion synthesizer (inference-only port).
+
+    Pipeline at inference:
+      1. `enc_p(phone, pitch, lengths)` -> posterior parameters `(m_p, logs_p)` and mask `x_mask`.
+      2. Sample `z_p ~ N(m_p, exp(logs_p))` with temperature `_INFER_NOISE_SCALE`, mask out invalid positions.
+      3. `flow(z_p, x_mask, g=g, reverse=True)` -> `z` in the prior space.
+      4. `dec(z * x_mask, nsff0, g=g)` -> generated audio.
+
+    For tests and deterministic conversion, the random tensors used at step 2 (`noise_z`) and inside the NSF source
+    module (`rand_ini`, `noise_raw`) are exposed as optional kwargs to `.infer`. Production callers can leave them as
+    `None` and get the original random behaviour.
+
+    The `sr` argument accepts either an integer sampling rate or a string shorthand (`"32k"` / `"40k"` / `"48k"`),
+    matching the reference's convenience handling.
+    """
+
+    _SR_ALIAS = {"32k": 32000, "40k": 40000, "48k": 48000}
+
+    def __init__(
+        self,
+        spec_channels: int,
+        segment_size: int,
+        inter_channels: int,
+        hidden_channels: int,
+        filter_channels: int,
+        n_heads: int,
+        n_layers: int,
+        kernel_size: int,
+        p_dropout: float,
+        resblock: str,
+        resblock_kernel_sizes: Tuple[int, ...],
+        resblock_dilation_sizes: Tuple[Tuple[int, ...], ...],
+        upsample_rates: Tuple[int, ...],
+        upsample_initial_channel: int,
+        upsample_kernel_sizes: Tuple[int, ...],
+        spk_embed_dim: int,
+        gin_channels: int,
+        sr,
+        **kwargs,
+    ):
+        super().__init__()
+        if isinstance(sr, str):
+            sr = self._SR_ALIAS[sr]
+        self.spec_channels = spec_channels
+        self.segment_size = segment_size
+        self.inter_channels = inter_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.resblock = resblock
+        self.resblock_kernel_sizes = tuple(resblock_kernel_sizes)
+        self.resblock_dilation_sizes = tuple(tuple(d) for d in resblock_dilation_sizes)
+        self.upsample_rates = tuple(upsample_rates)
+        self.upsample_initial_channel = upsample_initial_channel
+        self.upsample_kernel_sizes = tuple(upsample_kernel_sizes)
+        self.spk_embed_dim = spk_embed_dim
+        self.gin_channels = gin_channels
+        self.sr = sr
+
+        self.enc_p = TextEncoder768(
+            out_channels=inter_channels,
+            hidden_channels=hidden_channels,
+            filter_channels=filter_channels,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            kernel_size=kernel_size,
+            p_dropout=float(p_dropout),
+        )
+        self.dec = GeneratorNSF(
+            initial_channel=inter_channels,
+            resblock=resblock,
+            resblock_kernel_sizes=tuple(resblock_kernel_sizes),
+            resblock_dilation_sizes=tuple(tuple(d) for d in resblock_dilation_sizes),
+            upsample_rates=tuple(upsample_rates),
+            upsample_initial_channel=upsample_initial_channel,
+            upsample_kernel_sizes=tuple(upsample_kernel_sizes),
+            gin_channels=gin_channels,
+            sr=sr,
+            is_half=False,
+        )
+        self.flow = ResidualCouplingBlock(
+            channels=inter_channels,
+            hidden_channels=hidden_channels,
+            kernel_size=5,
+            dilation_rate=1,
+            n_layers=4,
+            gin_channels=gin_channels,
+        )
+        self.emb_g = nn.Embedding(spk_embed_dim, gin_channels)
+
+    def infer(
+        self,
+        phone: mx.array,
+        phone_lengths: mx.array,
+        pitch: mx.array,
+        nsff0: mx.array,
+        sid: mx.array,
+        max_len: Optional[int] = None,
+        *,
+        noise_z: Optional[mx.array] = None,
+        rand_ini: Optional[mx.array] = None,
+        noise_raw: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, mx.array, Tuple[mx.array, mx.array, mx.array, mx.array]]:
+        """
+        Run the full inference pipeline.
+
+        :param phone: per-frame content features, shape `(B, T, 768)`.
+        :param phone_lengths: valid lengths along the time axis, shape `(B,)`.
+        :param pitch: per-frame integer pitch class in `[0, 255]`, shape `(B, T)`.
+        :param nsff0: per-frame continuous f0 in Hz, shape `(B, T)`.
+        :param sid: per-batch speaker index, shape `(B,)`.
+        :param max_len: optionally truncate the flow output to this many frames before feeding the generator.
+        :param noise_z: standard-normal noise of shape `(B, T, inter_channels)` used for the posterior sample. Sampled
+            internally when `None`.
+        :param rand_ini: SineGen initial-phase noise of shape `(B, dim)`. Sampled internally when `None`.
+        :param noise_raw: SineGen unvoiced-region noise of shape `(B, T * upp, dim)`. Sampled internally when `None`.
+        :returns: a tuple `(o, x_mask, (z, z_p, m_p, logs_p))` where `o` is the generated audio of shape
+            `(B, T_audio, 1)`.
+        """
+        # Speaker embedding broadcast across time. (B,) -> (B, gin_channels) -> (B, 1, gin_channels).
+        g = mx.expand_dims(self.emb_g(sid), axis=1)
+        m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        if noise_z is None:
+            noise_z = mx.random.normal(m_p.shape).astype(m_p.dtype)
+        z_p = (m_p + mx.exp(logs_p) * noise_z * _INFER_NOISE_SCALE) * x_mask
+        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        z_masked = z * x_mask
+        if max_len is not None:
+            z_masked = z_masked[:, :max_len, :]
+            nsff0 = nsff0[:, :max_len]
+        o = self.dec(z_masked, nsff0, g=g, rand_ini=rand_ini, noise_raw=noise_raw)
+        return o, x_mask, (z, z_p, m_p, logs_p)

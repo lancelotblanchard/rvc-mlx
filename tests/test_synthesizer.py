@@ -25,6 +25,7 @@ from rvc_mlx.synthesizer import (
     ResidualCouplingLayer,
     SineGen,
     SourceModuleHnNSF,
+    SynthesizerTrnMs768NSFsid,
     TextEncoder768,
     WN,
 )
@@ -39,6 +40,7 @@ from rvc_mlx._torch_ref import (
     TorchResidualCouplingLayer,
     TorchSineGen,
     TorchSourceModuleHnNSF,
+    TorchSynthesizerTrnMs768NSFsid,
     TorchTextEncoder768,
     TorchTransformerEncoder,
     TorchWN,
@@ -56,6 +58,7 @@ from .torch_bridge import (
     copy_source_module_hn_nsf,
     copy_text_encoder_768,
     copy_transformer_encoder,
+    copy_synthesizer_trn_ms768_nsfsid,
     copy_wn,
     set_eval,
     to_time_first,
@@ -1227,6 +1230,137 @@ class TestSynthesizerResidualCouplingBlockForward(BaseOperationTest):
             description="ResidualCouplingBlock forward pass (training path)",
             atol=1e-4,
             rtol=1e-4,
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Full synthesizer (`SynthesizerTrnMs768NSFsid.infer`) end-to-end test.
+#
+# Uses a scaled-down config to keep the test runtime manageable (real RVC config has ~25M params; the test config is
+# tiny but exercises every code path).
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+# Scaled-down synthesizer config. The 768 in `TextEncoder768` is hard-coded (it's the HuBERT feature dim), so phone
+# inputs must be (B, T, 768) regardless.
+_SYNTH_TEST_CONFIG = dict(
+    spec_channels=64,  # unused at inference (no enc_q)
+    segment_size=128,  # unused at inference
+    inter_channels=8,
+    hidden_channels=8,
+    filter_channels=16,
+    n_heads=2,
+    n_layers=2,
+    kernel_size=3,
+    p_dropout=0.0,
+    resblock="1",
+    resblock_kernel_sizes=(3, 7),
+    resblock_dilation_sizes=((1, 3, 5), (1, 3, 5)),
+    upsample_rates=(4, 2),
+    upsample_initial_channel=32,
+    upsample_kernel_sizes=(8, 4),
+    spk_embed_dim=4,
+    gin_channels=4,
+    sr=16000,
+)
+
+
+def _build_synthesizer_pair(seed=0, **overrides):
+    config = {**_SYNTH_TEST_CONFIG, **overrides}
+    torch.manual_seed(seed)
+    t_syn = TorchSynthesizerTrnMs768NSFsid(**config)
+    # Randomize post-conv weights inside flow's coupling layers (default zero-init makes the flow an identity).
+    with torch.no_grad():
+        for flow in t_syn.flow.flows:
+            if hasattr(flow, "post"):
+                flow.post.weight.copy_(torch.randn_like(flow.post.weight) * 0.1)
+                flow.post.bias.copy_(torch.randn_like(flow.post.bias) * 0.1)
+    m_syn = SynthesizerTrnMs768NSFsid(**config)
+    copy_synthesizer_trn_ms768_nsfsid(t_syn, m_syn)
+    set_eval(t_syn, m_syn)
+    upp = int(np.prod(config["upsample_rates"]))
+    return t_syn, m_syn, config, upp
+
+
+def _synth_inputs(batch, T, inter_channels, upp, spk_embed_dim, rng):
+    phone = rng.standard_normal((batch, T, 768)).astype(np.float32)
+    pitch = rng.integers(0, 256, size=(batch, T)).astype(np.int64)
+    nsff0 = rng.uniform(50.0, 500.0, size=(batch, T)).astype(np.float32)
+    nsff0[:, -2:] = 0.0
+    phone_lengths = np.array([T] * batch, dtype=np.int64)
+    sid = rng.integers(0, spk_embed_dim, size=(batch,)).astype(np.int64)
+    # Random tensors that drive otherwise-stochastic parts of the network.
+    noise_z = rng.standard_normal((batch, T, inter_channels)).astype(np.float32)
+    rand_ini = rng.uniform(size=(batch, 1)).astype(np.float32)  # dim == 1 for harmonic_num=0
+    noise_raw = rng.standard_normal((batch, T * upp, 1)).astype(np.float32)
+    return phone, phone_lengths, pitch, nsff0, sid, noise_z, rand_ini, noise_raw
+
+
+class TestSynthesizerFullInfer(BaseOperationTest):
+    """End-to-end inference: TextEncoder768 -> flow (reverse) -> GeneratorNSF, with shared noise tensors."""
+
+    @classmethod
+    def setup_class(cls):
+        t_syn, m_syn, config, upp = _build_synthesizer_pair()
+
+        def mlx_fn(phone, phone_lengths, pitch, nsff0, sid, noise_z, rand_ini, noise_raw):
+            o, _, _ = m_syn.infer(
+                phone,
+                phone_lengths,
+                pitch,
+                nsff0,
+                sid,
+                noise_z=noise_z,
+                rand_ini=rand_ini,
+                noise_raw=noise_raw,
+            )
+            # o: (B, T_audio, 1) -> (B, 1, T_audio) for comparison with PyTorch reference.
+            return to_time_first(o)
+
+        def torch_fn(phone, phone_lengths, pitch, nsff0, sid, noise_z, rand_ini, noise_raw):
+            with torch.no_grad():
+                o, _, _ = t_syn.infer(
+                    phone,
+                    phone_lengths,
+                    pitch,
+                    nsff0,
+                    sid,
+                    noise_z=noise_z,
+                    rand_ini=rand_ini,
+                    noise_raw=noise_raw,
+                )
+            return o
+
+        cls.suite = OperationTestSuite(mlx_fn, torch_fn, "synthesizer_infer")
+
+        rng = np.random.default_rng(0)
+        phone, phone_lengths, pitch, nsff0, sid, noise_z, rand_ini, noise_raw = _synth_inputs(
+            batch=1,
+            T=8,
+            inter_channels=config["inter_channels"],
+            upp=upp,
+            spk_embed_dim=config["spk_embed_dim"],
+            rng=rng,
+        )
+        cls.suite.add_test_case(
+            name="full_infer_scaled_config",
+            inputs={
+                "phone": phone,
+                "phone_lengths": phone_lengths,
+                "pitch": pitch,
+                "nsff0": nsff0,
+                "sid": sid,
+                "noise_z": noise_z,
+                "rand_ini": rand_ini,
+                "noise_raw": noise_raw,
+            },
+            description=(
+                "End-to-end SynthesizerTrnMs768NSFsid.infer with the scaled-down test config. Shared noise tensors "
+                "make the comparison deterministic across MLX and PyTorch."
+            ),
+            # Many compounded floating-point operations: looser tolerance than per-module tests.
+            atol=5e-3,
+            rtol=5e-3,
         )
 
 

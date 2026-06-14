@@ -35,6 +35,7 @@ from rvc_mlx._convert_bridge import (  # noqa: F401 — explicit re-export for I
     copy_wn,
     copy_residual_coupling_layer,
     copy_residual_coupling_block,
+    copy_synthesizer_trn_ms768_nsfsid,
     to_channels_last,
     to_channels_first,
     to_time_last,

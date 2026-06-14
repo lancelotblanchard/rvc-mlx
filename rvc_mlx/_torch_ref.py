@@ -1059,3 +1059,120 @@ class TorchResidualCouplingBlock(torch.nn.Module):
             for flow in self.flows[::-1]:
                 x, _ = flow(x, x_mask, g=g, reverse=reverse)
         return x
+
+
+_INFER_NOISE_SCALE = 0.66666
+
+
+class TorchSynthesizerTrnMs768NSFsid(torch.nn.Module):
+    """
+    PyTorch reference for the inference-only variant of `SynthesizerTrnMs768NSFsid`.
+
+    Differences from the RVC original:
+      * The training-time posterior encoder (`enc_q`) is omitted (not used by `infer`).
+      * `infer` accepts explicit `noise_z`, `rand_ini`, `noise_raw` kwargs so paired-module tests can match the
+        MLX version's deterministic random behaviour.
+    """
+
+    _SR_ALIAS = {"32k": 32000, "40k": 40000, "48k": 48000}
+
+    def __init__(
+        self,
+        spec_channels,
+        segment_size,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        spk_embed_dim,
+        gin_channels,
+        sr,
+        **kwargs,
+    ):
+        super().__init__()
+        if isinstance(sr, str):
+            sr = self._SR_ALIAS[sr]
+        self.spec_channels = spec_channels
+        self.inter_channels = inter_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.resblock = resblock
+        self.resblock_kernel_sizes = resblock_kernel_sizes
+        self.resblock_dilation_sizes = resblock_dilation_sizes
+        self.upsample_rates = upsample_rates
+        self.upsample_initial_channel = upsample_initial_channel
+        self.upsample_kernel_sizes = upsample_kernel_sizes
+        self.segment_size = segment_size
+        self.spk_embed_dim = spk_embed_dim
+        self.gin_channels = gin_channels
+        self.sr = sr
+
+        self.enc_p = TorchTextEncoder768(
+            out_channels=inter_channels,
+            hidden_channels=hidden_channels,
+            filter_channels=filter_channels,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            kernel_size=kernel_size,
+            p_dropout=float(p_dropout),
+        )
+        self.dec = TorchGeneratorNSF(
+            initial_channel=inter_channels,
+            resblock=resblock,
+            resblock_kernel_sizes=resblock_kernel_sizes,
+            resblock_dilation_sizes=resblock_dilation_sizes,
+            upsample_rates=upsample_rates,
+            upsample_initial_channel=upsample_initial_channel,
+            upsample_kernel_sizes=upsample_kernel_sizes,
+            gin_channels=gin_channels,
+            sr=sr,
+            is_half=False,
+        )
+        self.flow = TorchResidualCouplingBlock(
+            channels=inter_channels,
+            hidden_channels=hidden_channels,
+            kernel_size=5,
+            dilation_rate=1,
+            n_layers=4,
+            gin_channels=gin_channels,
+        )
+        self.emb_g = torch.nn.Embedding(spk_embed_dim, gin_channels)
+
+    def infer(
+        self,
+        phone,
+        phone_lengths,
+        pitch,
+        nsff0,
+        sid,
+        max_len=None,
+        *,
+        noise_z=None,
+        rand_ini=None,
+        noise_raw=None,
+    ):
+        g = self.emb_g(sid).unsqueeze(-1)  # (B, gin, 1)
+        m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        if noise_z is None:
+            noise_z = torch.randn_like(m_p)
+        z_p = (m_p + torch.exp(logs_p) * noise_z * _INFER_NOISE_SCALE) * x_mask
+        z = self.flow(z_p, x_mask, g=g, reverse=True)
+        z_masked = z * x_mask
+        if max_len is not None:
+            z_masked = z_masked[:, :, :max_len]
+            nsff0 = nsff0[:, :max_len]
+        o = self.dec(z_masked, nsff0, g=g, rand_ini=rand_ini, noise_raw=noise_raw)
+        return o, x_mask, (z, z_p, m_p, logs_p)

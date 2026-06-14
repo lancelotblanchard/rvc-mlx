@@ -389,6 +389,14 @@ def copy_generator_nsf(torch_gen, mlx_gen) -> None:
         copy_conv1d(torch_gen.cond, mlx_gen.cond)
 
 
+def copy_synthesizer_trn_ms768_nsfsid(torch_syn, mlx_syn) -> None:
+    """Copy the full inference synthesizer (TextEncoder768 + GeneratorNSF + ResidualCouplingBlock + speaker Embedding)."""
+    copy_text_encoder_768(torch_syn.enc_p, mlx_syn.enc_p)
+    copy_generator_nsf(torch_syn.dec, mlx_syn.dec)
+    copy_residual_coupling_block(torch_syn.flow, mlx_syn.flow)
+    copy_embedding(torch_syn.emb_g, mlx_syn.emb_g)
+
+
 def set_eval(*modules: Iterable) -> None:
     """Put a heterogeneous set of MLX and PyTorch modules into eval mode."""
     for m in modules:
