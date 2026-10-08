@@ -149,6 +149,11 @@ int main(int argc, char** argv) {
             check(std::string("progress reaches 1 (") + name + ")", last == 1.0f);
         }
         VoicePtr v = loadVoice(dir + "/v2_f0.safetensors");
+        ConvertOptions edge;
+        edge.indexRate = 0.5f;
+        edge.deterministic = true;
+        compare("pipeline split at the last frame", engine.convert(toVector(g("edge_audio")), *v, edge),
+                toVector(g("pipe_edge")), 3e-3);
         bool cancelled = false;
         try {
             engine.convert(audio, *v, {}, [](float) { return false; });

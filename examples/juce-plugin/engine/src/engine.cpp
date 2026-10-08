@@ -149,7 +149,7 @@ std::vector<float> Engine::convert(const std::vector<float>& audio16k, const Voi
     for (size_t i = 0; i < opt_ts.size(); ++i) {
         t = opt_ts[i] / kWindow * kWindow;
         // The reference also bounds the pitch slice at (t + tPad2) / window; vc() truncates to the feature length.
-        runChunk(s, t + tPad2 + kWindow, s / kWindow);
+        runChunk(s, std::min(static_cast<long>(pad.size()), t + tPad2 + kWindow), s / kWindow);  // slices clamp, like numpy
         s = t;
     }
     runChunk(t < 0 ? 0 : t, static_cast<long>(pad.size()), t < 0 ? 0 : t / kWindow);

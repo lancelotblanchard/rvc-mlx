@@ -135,6 +135,17 @@ def golden_small(out):
                         "b": dict(f0_up_key=-5, index_rate=0.0, protect=0.5, rms_mix_rate=1.0)}.items():
             g[f"pipe_{name}_{tag}"] = mx.array(pipe.pipeline(hubert, v, 1, audio, deterministic=True, **kw))
 
+    # Edge case: the last split point lands in the final frame, so the chunk slice must clamp at the end of the
+    # padded audio (numpy slicing does; the C++/Swift ports have to do it explicitly).
+    edge = (0.3 * np.random.default_rng(5).standard_normal(96050)).astype(np.float32)  # no quiet stretch except...
+    edge[-50:] = 0.0  # ...the tail, so the 6 s split point lands within the last frame
+    v = Voice.load(f"{out}/v2_f0.safetensors")
+    pipe = Pipeline(v.sample_rate, PipelineConfig(**CHUNKING), rmvpe=rmvpe)
+    ts = pipe.split_points(highpass(edge.astype(np.float64)))
+    assert ts and ts[-1] // 160 * 160 > len(edge) - 160, (ts, len(edge))
+    g["edge_audio"] = edge
+    g["pipe_edge"] = mx.array(pipe.pipeline(hubert, v, 0, edge, deterministic=True, f0_up_key=0, index_rate=0.5))
+
     a, b = Voice.load(f"{out}/v2_f0.safetensors"), Voice.load(f"{out}/v2_f0_b.safetensors")
     blended = blend_weights([a, b], [0.3, 0.7])
     for key in ("dec.ups.0.weight", "enc_p.emb_phone.weight", "emb_g.weight", "flow.flows.2.enc.cond_layer.weight"):
