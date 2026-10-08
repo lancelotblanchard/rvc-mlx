@@ -30,7 +30,7 @@ The AU and VST3 are copied to `~/Library/Audio/Plug-Ins/{Components,VST3}`. The 
 `build/RVCMorph_artefacts/Release/Standalone/`.
 
 Faster builds: if MLX is already installed (`pip install mlx` or `brew install mlx`), add
-`-DRVC_MLX_FROM_SOURCE=OFF -DMLX_DIR=$(python -m mlx --cmake-dir)`. To use a local JUCE checkout instead of
+`-DRVC_MLX_FROM_SOURCE=OFF -DCMAKE_PREFIX_PATH=$(python -m mlx --cmake-dir)`. To use a local JUCE checkout instead of
 fetching one, add `-DRVC_JUCE_SOURCE=/path/to/JUCE`.
 
 ## Use
@@ -69,7 +69,7 @@ that isn't the case.
 ```bash
 # Engine vs the Python implementation (from the repo root, with the dev extras installed)
 python examples/juce-plugin/engine/tests/make_golden.py /tmp/rvc-golden
-cmake -B build-engine -DRVC_ENGINE_TESTS=ON -DMLX_DIR=$(python -m mlx --cmake-dir) examples/juce-plugin/engine
+cmake -B build-engine -DRVC_ENGINE_TESTS=ON -DCMAKE_PREFIX_PATH=$(python -m mlx --cmake-dir) examples/juce-plugin/engine
 cmake --build build-engine && ./build-engine/rvc_parity_test /tmp/rvc-golden
 
 # Plug-in smoke test: streams audio through the live path and snapshots the editor

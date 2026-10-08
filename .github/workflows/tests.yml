@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  python:
+    name: Python package
     runs-on: [macos-latest]
     strategy:
       fail-fast: false
@@ -25,7 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -e ".[dev]"
+        pip install -e ".[dev,server]" httpx
 
     - name: Run tests
       run: |
@@ -39,3 +40,109 @@ jobs:
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
+
+  # Reference outputs from the Python implementation, shared by the C++ and Swift parity tests.
+  golden:
+    name: Golden data
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+        cache: 'pip'
+    - run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+        python examples/juce-plugin/engine/tests/make_golden.py golden
+        mkdir -p golden/voices && cp golden/v2_f0.safetensors golden/voices/nova.safetensors && cp golden/v2_f0_b.safetensors golden/voices/echo.safetensors
+    - uses: actions/upload-artifact@v4
+      with:
+        name: golden
+        path: |
+          golden/*.safetensors
+          golden/voices
+        retention-days: 3
+
+  engine:
+    name: C++ engine parity (Metal)
+    needs: golden
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+    - uses: actions/download-artifact@v4
+      with:
+        name: golden
+        path: golden
+    - name: Build and run
+      run: |
+        pip install "mlx==0.30.1"
+        cmake -S examples/juce-plugin/engine -B build-engine -DRVC_ENGINE_TESTS=ON -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_PREFIX_PATH="$(python -m mlx --cmake-dir)"
+        cmake --build build-engine -j 4
+        ./build-engine/rvc_parity_test golden
+
+  swift:
+    name: RVCKit parity (Swift, Metal)
+    needs: golden
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: golden
+        path: golden
+    - name: Test (xcodebuild builds MLX's Metal kernels; `swift test` can't)
+      working-directory: examples/ios/RVCKit
+      run: |
+        TEST_RUNNER_RVC_GOLDEN_DIR="$GITHUB_WORKSPACE/golden" \
+        xcodebuild test -scheme RVCKit -destination 'platform=macOS' -skipMacroValidation -skipPackagePluginValidation
+
+  ios-app:
+    name: iOS app builds
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build (unsigned)
+      working-directory: examples/ios
+      run: |
+        brew install xcodegen
+        xcodegen
+        xcodebuild -project RVCPocket.xcodeproj -scheme RVCPocket -destination 'generic/platform=iOS' \
+                   -skipMacroValidation -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO build
+
+  plugin:
+    name: Plug-in (ARA) builds and streams
+    needs: golden
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+    - uses: actions/download-artifact@v4
+      with:
+        name: golden
+        path: golden
+    - name: ARA SDK
+      run: git clone --depth 1 --recursive --branch releases/2.2.0 https://github.com/Celemony/ARA_SDK.git "$RUNNER_TEMP/ARA_SDK"
+    - name: Build
+      run: |
+        pip install "mlx==0.30.1"
+        cmake -S examples/juce-plugin -B build-plugin -DCMAKE_BUILD_TYPE=Release -DRVC_PLUGIN_TESTS=ON \
+              -DRVC_MLX_FROM_SOURCE=OFF -DCMAKE_PREFIX_PATH="$(python -m mlx --cmake-dir)" \
+              -DARA_SDK_PATH="$RUNNER_TEMP/ARA_SDK"
+        cmake --build build-plugin --target RVCMorph_VST3 RVCMorph_AU RVCMorphSmokeTest -j 4
+    - name: Smoke test (live path + editor snapshot)
+      run: |
+        TEST=$(find build-plugin -name RVCMorphSmokeTest -type f -perm -u+x | head -1)
+        "$TEST" golden golden/voices/nova.safetensors golden/voices/echo.safetensors editor.png
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: plugin-editor
+        path: editor.png
+        if-no-files-found: ignore

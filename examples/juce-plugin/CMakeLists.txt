@@ -5,7 +5,7 @@
 #
 # Dependencies are fetched automatically unless you point CMake at local copies:
 #   JUCE_DIR / -DRVC_JUCE_SOURCE=<path>   JUCE 7.0.5+ or 8.x
-#   -DRVC_MLX_FROM_SOURCE=OFF + MLX_DIR    an installed MLX (`python -m mlx --cmake-dir`, or Homebrew)
+#   -DRVC_MLX_FROM_SOURCE=OFF -DCMAKE_PREFIX_PATH=$(python -m mlx --cmake-dir)   an installed MLX (pip or Homebrew)
 cmake_minimum_required(VERSION 3.22)
 project(RVCMorph VERSION 0.2.0 LANGUAGES C CXX)
 
