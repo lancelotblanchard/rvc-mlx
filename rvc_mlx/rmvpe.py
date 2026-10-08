@@ -10,6 +10,24 @@ from rvc_mlx.utils import pad_constant
 from rvc_mlx.windows import hann
 
 
+# Front-end settings of the released RMVPE model. `MelSpectrogram` below is built with these by `RMVPE.__init__`.
+RMVPE_MEL = dict(n_mel_channels=128, sampling_rate=16000, win_length=1024, hop_length=160, mel_fmin=30, mel_fmax=8000)
+# Name under which converted `rmvpe.safetensors` files carry the precomputed mel filterbank (for non-Python runtimes).
+MEL_BASIS_KEY = "mel_basis"
+
+
+def rmvpe_mel_basis() -> np.ndarray:
+    """The (128, 513) HTK mel filterbank RMVPE uses, exactly as `librosa.filters.mel(..., htk=True)` builds it."""
+    return librosa.filters.mel(
+        sr=RMVPE_MEL["sampling_rate"],
+        n_fft=RMVPE_MEL["win_length"],
+        n_mels=RMVPE_MEL["n_mel_channels"],
+        fmin=RMVPE_MEL["mel_fmin"],
+        fmax=RMVPE_MEL["mel_fmax"],
+        htk=True,
+    ).astype(np.float32)
+
+
 class MelSpectrogram:
     """
     Mel spectrogram extractor matching the RVC reference implementation. Computes the log-mel spectrogram of an audio
@@ -441,10 +459,13 @@ class RMVPE:
         """
         # Late import to avoid a circular import (convert.py imports rmvpe.E2E for the destination model).
         from rvc_mlx.convert import ensure_safetensors
+        from rvc_mlx.io import load_converted
 
         safetensors_path = ensure_safetensors(path, is_half=is_half)
+        weights, _ = load_converted(safetensors_path, expected_kind="rmvpe", dtype=mx.float32)
+        weights.pop(MEL_BASIS_KEY, None)  # front-end constant, recomputed by MelSpectrogram
         model = E2E(**_DEFAULT_E2E_CONFIG)
-        model.load_weights(safetensors_path)
+        model.load_weights(list(weights.items()))
         # Inference-only: pin BatchNorm to use the running stats baked into the checkpoint. The train/eval flag is
         # not part of the safetensors, so a freshly-built MLX module defaults to train mode after `load_weights`.
         model.eval()
@@ -531,6 +552,8 @@ class RMVPE:
         """
         if audio.ndim != 1:
             raise ValueError(f"Expected a 1D audio array, got shape {audio.shape}")
-        mel = self.mel_extractor(mx.expand_dims(audio, 0))
+        if not isinstance(audio, mx.array):
+            audio = mx.array(np.asarray(audio, dtype=np.float32))
+        mel = self.mel_extractor(mx.expand_dims(audio.astype(mx.float32), 0))
         hidden = self.mel2hidden(mel)
         return self.decode(hidden, thred=thred)[0]

@@ -7,3 +7,10 @@ __pycache__
 
 .DS_Store
 .idea
+# converted models / local artefacts
+*.safetensors
+*.pth
+*.pt
+*.index
+models/
+build/

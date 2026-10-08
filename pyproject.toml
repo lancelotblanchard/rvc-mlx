@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rvc-mlx"
-version = "0.1.0"
-description = "My WIP implementation of RVC in MLX"
+version = "0.2.0"
+description = "RVC (Retrieval-based Voice Conversion) inference on Apple silicon with MLX"
 readme = "README.md"
 authors = [
     {name = "Lancelot Blanchard", email = "lancelot@media.mit.edu"}
@@ -30,13 +30,19 @@ dependencies = [
     "mlx==0.30.1",
     "numpy==2.3.5",
     "librosa>=0.10.0",
+    "scipy>=1.10",
+    "soundfile>=0.12",
 ]
+
+[project.scripts]
+rvc-mlx = "rvc_mlx.cli:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "torch==2.4.1",
+    "faiss-cpu>=1.7",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "isort>=5.12.0",
@@ -46,14 +52,30 @@ test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "torch==2.4.1",
+    "faiss-cpu>=1.7",
 ]
 torch = [
     "torch==2.4.1",
+]
+# Converting PyTorch checkpoints (`rvc-mlx convert-base` / `convert-voice`). faiss is only needed for `.index` files.
+convert = [
+    "torch==2.4.1",
+    "faiss-cpu>=1.7",
+]
+# The local web demo in examples/web-server.
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
 ]
 all = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "torch==2.4.1",
+    "faiss-cpu>=1.7",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "isort>=5.12.0",

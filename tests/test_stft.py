@@ -2,6 +2,7 @@ from functools import partial
 
 import pytest
 import numpy as np
+import mlx.core as mx
 from rvc_mlx.stft import stft
 import torch
 
@@ -151,3 +152,30 @@ class TestUtilsStftWithWindow(BaseOperationTest):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+class TestStftValidation:
+    """Invalid arguments raise (they used to be silently returned as exception objects)."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            dict(n_fft=64, center=False),  # n_fft > signal length
+            dict(n_fft=16, hop_length=-1),
+            dict(n_fft=16, win_length=32),
+            dict(n_fft=16, window=mx.ones((8,))),
+            dict(n_fft=16, normalized=True),
+            dict(n_fft=16, return_complex=False),
+        ],
+    )
+    def test_invalid_arguments_raise(self, kwargs):
+        with pytest.raises(ValueError):
+            stft(mx.zeros((32,)), **kwargs)
+
+    def test_rejects_bad_inputs(self):
+        with pytest.raises(ValueError):
+            stft(mx.zeros((32,), dtype=mx.int32), n_fft=16)
+        with pytest.raises(ValueError):
+            stft(mx.zeros((1, 1, 32)), n_fft=16)
+        with pytest.raises(NotImplementedError):
+            stft(mx.zeros((32,)), n_fft=16, pad_mode="circular")

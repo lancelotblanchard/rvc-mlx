@@ -45,7 +45,7 @@ def _make_pipeline(f0_raw: np.ndarray, x_pad: int = 1) -> Pipeline:
     p.x_max = 41
     p.is_half = False
     p.sr = 16_000
-    p.window = 16
+    p.window = 160
     p.t_pad = p.sr * p.x_pad
     p.t_pad_tgt = p.sr * p.x_pad
     p.t_pad2 = p.t_pad * 2
@@ -159,7 +159,7 @@ class TestGetF0InpF0Splice:
     """`inp_f0` overrides a slice of the (post-shift) f0 with user values, linearly interpolated frame-by-frame.
 
     Splice geometry from the implementation:
-      tf0  = sr // window               # 1000 frames per second at sr=16000, window=16
+      tf0  = sr // window               # 100 frames per second at sr=16000, window=160
       start = x_pad * tf0               # frame index where the user f0 takes over
       delta_t = round((t_max - t_min) * tf0 + 1)
       replace = np.interp(range(delta_t), inp_f0[:, 0] * 100, inp_f0[:, 1])
@@ -168,7 +168,7 @@ class TestGetF0InpF0Splice:
 
     def test_splice_replaces_expected_slice(self):
         x_pad = 1
-        tf0 = 16000 // 16  # 1000
+        tf0 = 16000 // 160  # 100
         start = x_pad * tf0
 
         # Build f0 long enough to hold a splice well past the start offset.
@@ -176,16 +176,16 @@ class TestGetF0InpF0Splice:
         pipe = _make_pipeline(f0_raw, x_pad=x_pad)
 
         # Two control points: (t=0.00, f0=200), (t=0.05, f0=400). After * 100 the x-coords are [0, 5] (frames),
-        # so np.interp over range(delta_t) covers 51 frames.
+        # so np.interp over range(delta_t) covers 6 frames.
         inp_f0 = np.array(
             [
                 [0.00, 200.0],
                 [0.05, 400.0],
             ]
         )
-        delta_t = int(np.round((0.05 - 0.00) * tf0 + 1))  # 51
+        delta_t = int(np.round((0.05 - 0.00) * tf0 + 1))  # 6
 
-        # Reference: interp on [0, 5] (the * 100 mapping) across range(51).
+        # Reference: interp on [0, 5] (the * 100 mapping) across range(6).
         expected_replace = np.interp(np.arange(delta_t), inp_f0[:, 0] * 100, inp_f0[:, 1])
 
         _, f0bak = pipe.get_f0(x=np.zeros(16000), f0_up_key=0, inp_f0=inp_f0)
@@ -201,12 +201,12 @@ class TestGetF0InpF0Splice:
         # exactly as given, regardless of `f0_up_key`. This pins that ordering: changing it would silently warp
         # user-provided pitch curves.
         x_pad = 1
-        tf0 = 16000 // 16
+        tf0 = 16000 // 160
         start = x_pad * tf0
 
         f0_raw = np.full(start + 100, 300.0)
         inp_f0 = np.array([[0.00, 200.0], [0.02, 200.0]])  # flat 200 Hz region
-        delta_t = int(np.round(0.02 * tf0 + 1))  # 21 frames
+        delta_t = int(np.round(0.02 * tf0 + 1))  # 3 frames
 
         pipe = _make_pipeline(f0_raw, x_pad=x_pad)
         _, f0bak = pipe.get_f0(x=np.zeros(16000), f0_up_key=12, inp_f0=inp_f0)
@@ -220,17 +220,17 @@ class TestGetF0InpF0Splice:
         # The implementation uses `shape = f0[start:start+len].shape[0]` and writes `replace[:shape]` so a long
         # interpolation gracefully truncates at the array end without raising.
         x_pad = 1
-        tf0 = 16000 // 16
+        tf0 = 16000 // 160
         start = x_pad * tf0
 
-        # Only 10 frames of room past `start`.
-        f0_raw = np.full(start + 10, 300.0)
-        inp_f0 = np.array([[0.00, 200.0], [0.05, 400.0]])  # would want 51 frames; truncates to 10.
+        # Only 3 frames of room past `start`.
+        f0_raw = np.full(start + 3, 300.0)
+        inp_f0 = np.array([[0.00, 200.0], [0.05, 400.0]])  # would want 6 frames; truncates to 3.
 
         pipe = _make_pipeline(f0_raw, x_pad=x_pad)
         _, f0bak = pipe.get_f0(x=np.zeros(16000), f0_up_key=0, inp_f0=inp_f0)
 
-        expected_replace = np.interp(np.arange(51), inp_f0[:, 0] * 100, inp_f0[:, 1])[:10]
+        expected_replace = np.interp(np.arange(6), inp_f0[:, 0] * 100, inp_f0[:, 1])[:3]
         np.testing.assert_allclose(f0bak[start:], expected_replace)
 
 

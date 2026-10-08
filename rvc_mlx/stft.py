@@ -80,14 +80,14 @@ def stft(
     batch = x.shape[0]
     length = x.shape[1]
     if n_fft <= 0 or n_fft > length:
-        return ValueError(f"Expected 0 < n_fft < {len}, but got n_fft={win_length}")
+        raise ValueError(f"Expected 0 < n_fft <= {length}, but got n_fft={n_fft}")
     if hop_length <= 0:
-        return ValueError(f"Expected hop_length > 0, but got hop_length={hop_length}")
+        raise ValueError(f"Expected hop_length > 0, but got hop_length={hop_length}")
     if win_length <= 0 or win_length > n_fft:
-        return ValueError(f"expected 0 < win_length <= n_fft, but got win_length={win_length}")
+        raise ValueError(f"expected 0 < win_length <= n_fft, but got win_length={win_length}")
     if window is not None and (window.ndim != 1 or window.shape[0] != win_length):
-        return ValueError(
-            f"Expected a 1D window tensor of size equal to win_length={win_length}, but got window with"
+        raise ValueError(
+            f"Expected a 1D window tensor of size equal to win_length={win_length}, but got window with "
             f"size {window.shape}"
         )
 
