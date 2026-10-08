@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVC MLX</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --ink: #18181b; --muted: #71717a; --line: #e4e4e7;
+    --accent: #ff5a36; --accent-ink: #ffffff; --soft: #f1f1ef; --radius: 18px;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e0e10; --card: #18181b; --ink: #f4f4f5; --muted: #a1a1aa; --line: #27272a; --soft: #222226; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+    display: flex; justify-content: center; padding: 48px 16px;
+  }
+  main { width: 100%; max-width: 560px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 24px; }
+  h1 { font-size: 22px; letter-spacing: -0.02em; margin: 0; font-weight: 650; }
+  .tag { color: var(--muted); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; margin-bottom: 14px; }
+  .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 12px; font-weight: 600; }
+
+  .input-row { display: flex; gap: 16px; align-items: center; }
+  .rec { width: 64px; height: 64px; border-radius: 50%; border: none; cursor: pointer; flex: none;
+         background: var(--accent); color: var(--accent-ink); display: grid; place-items: center;
+         transition: transform .15s ease, box-shadow .2s ease; box-shadow: 0 6px 18px -6px var(--accent); }
+  .rec:hover { transform: scale(1.04); }
+  .rec .dot { width: 20px; height: 20px; border-radius: 50%; background: currentColor; transition: border-radius .2s, width .2s, height .2s; }
+  .rec.on .dot { border-radius: 4px; width: 18px; height: 18px; }
+  .rec.on { animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 18%, transparent); } }
+  .drop { flex: 1; border: 1.5px dashed var(--line); border-radius: 14px; padding: 14px 16px; color: var(--muted);
+          cursor: pointer; transition: border-color .15s, background .15s; min-height: 64px; display: flex; align-items: center; }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--soft); }
+  .drop strong { color: var(--ink); font-weight: 600; }
+  audio { width: 100%; margin-top: 14px; height: 36px; }
+
+  .voices { display: flex; flex-wrap: wrap; gap: 8px; }
+  .voice { border: 1px solid var(--line); background: var(--soft); color: var(--ink); border-radius: 999px;
+           padding: 8px 14px; cursor: pointer; font: inherit; font-size: 14px; transition: all .15s; }
+  .voice small { color: var(--muted); margin-left: 6px; font-size: 11px; }
+  .voice.sel { background: var(--ink); color: var(--card); border-color: var(--ink); }
+  .voice.sel small { color: inherit; opacity: .7; }
+  .empty { color: var(--muted); font-size: 14px; }
+
+  .slider { display: grid; grid-template-columns: 110px 1fr 52px; align-items: center; gap: 12px; margin: 10px 0; }
+  .slider span { font-size: 14px; }
+  .slider output { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 8px; list-style: none; }
+  details summary::before { content: "＋ "; }
+  details[open] summary::before { content: "－ "; }
+
+  .go { width: 100%; padding: 15px; border: none; border-radius: 14px; cursor: pointer; font: inherit; font-weight: 600;
+        font-size: 16px; background: var(--ink); color: var(--card); transition: opacity .15s, transform .1s; }
+  .go:disabled { opacity: .35; cursor: default; }
+  .go:not(:disabled):active { transform: scale(.99); }
+  .result { display: none; }
+  .result.show { display: block; }
+  .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .meta a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .err { color: #e5484d; font-size: 14px; margin-top: 10px; min-height: 1em; }
+  .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent;
+          border-radius: 50%; animation: r .7s linear infinite; vertical-align: -2px; margin-right: 8px; }
+  @keyframes r { to { transform: rotate(1turn); } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>RVC <span style="color:var(--accent)">MLX</span></h1>
+    <span class="tag">local voice conversion</span>
+  </header>
+
+  <section class="card">
+    <div class="label">1 · Input</div>
+    <div class="input-row">
+      <button class="rec" id="rec" title="Record"><span class="dot"></span></button>
+      <label class="drop" id="drop">
+        <span id="dropText"><strong>Record</strong>, or drop / choose an audio file</span>
+        <input type="file" id="file" accept="audio/*" hidden>
+      </label>
+    </div>
+    <audio id="inAudio" controls hidden></audio>
+  </section>
+
+  <section class="card">
+    <div class="label">2 · Voice</div>
+    <div class="voices" id="voices"><span class="empty">Loading…</span></div>
+    <div style="margin-top:16px">
+      <div class="slider"><span>Pitch</span><input type="range" id="pitch" min="-24" max="24" step="1" value="0"><output id="pitchOut">0 st</output></div>
+      <details>
+        <summary>Advanced</summary>
+        <div class="slider"><span>Index rate</span><input type="range" id="index_rate" min="0" max="1" step="0.05" value="0.75"><output></output></div>
+        <div class="slider"><span>Protect</span><input type="range" id="protect" min="0" max="0.5" step="0.01" value="0.33"><output></output></div>
+        <div class="slider"><span>Loudness mix</span><input type="range" id="rms_mix_rate" min="0" max="1" step="0.05" value="0.25"><output></output></div>
+      </details>
+    </div>
+  </section>
+
+  <button class="go" id="go" disabled>Convert</button>
+  <div class="err" id="err"></div>
+
+  <section class="card result" id="result">
+    <div class="label">Result</div>
+    <audio id="outAudio" controls></audio>
+    <div class="meta"><span id="stats"></span><a id="dl" download="converted.wav">Download</a></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let inputWav = null, voice = null, recorder = null, chunks = [];
+
+// ---------------------------------------------------------------- audio helpers
+async function toWav(blob) {
+  // Decode anything the browser can play and re-encode as 16-bit mono WAV, so the server never needs ffmpeg.
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+  ctx.close();
+  const n = buf.length, sr = buf.sampleRate, mono = new Float32Array(n);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < n; i++) mono[i] += d[i] / buf.numberOfChannels;
+  }
+  const out = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, s) => [...s].forEach((ch, i) => out.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, "RIFF"); out.setUint32(4, 36 + n * 2, true); str(8, "WAVEfmt ");
+  out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+  out.setUint32(24, sr, true); out.setUint32(28, sr * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+  str(36, "data"); out.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) out.setInt16(44 + i * 2, Math.max(-1, Math.min(1, mono[i])) * 0x7fff, true);
+  return { blob: new Blob([out], { type: "audio/wav" }), seconds: n / sr };
+}
+
+async function setInput(blob, label) {
+  try {
+    const { blob: wav, seconds } = await toWav(blob);
+    inputWav = wav;
+    $("inAudio").src = URL.createObjectURL(wav);
+    $("inAudio").hidden = false;
+    $("dropText").innerHTML = `<strong>${label}</strong> · ${seconds.toFixed(1)} s`;
+    $("err").textContent = "";
+  } catch (e) {
+    $("err").textContent = "Couldn't decode that audio file.";
+  }
+  refresh();
+}
+
+// ---------------------------------------------------------------- input
+$("rec").onclick = async () => {
+  if (recorder) { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+    recorder = new MediaRecorder(stream); chunks = [];
+    recorder.ondataavailable = (e) => chunks.push(e.data);
+    recorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      $("rec").classList.remove("on"); recorder = null;
+      setInput(new Blob(chunks, { type: chunks[0]?.type }), "Recording");
+    };
+    recorder.start(); $("rec").classList.add("on");
+    $("dropText").innerHTML = "<strong>Recording…</strong> click ■ to stop";
+  } catch { $("err").textContent = "Microphone access was denied."; }
+};
+$("file").onchange = (e) => e.target.files[0] && setInput(e.target.files[0], e.target.files[0].name);
+const drop = $("drop");
+["dragover", "dragenter"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => drop.addEventListener(t, () => drop.classList.remove("over")));
+drop.addEventListener("drop", (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; f && setInput(f, f.name); });
+
+// ---------------------------------------------------------------- voices & params
+async function loadVoices() {
+  const list = await (await fetch("/api/voices")).json();
+  const box = $("voices"); box.innerHTML = "";
+  if (!list.length) { box.innerHTML = '<span class="empty">No voices in models/voices/ yet — convert one with <code>rvc-mlx convert-voice</code>.</span>'; return; }
+  for (const v of list) {
+    const b = document.createElement("button");
+    b.className = "voice";
+    b.innerHTML = `${v.name}<small>${v.version} · ${v.sample_rate / 1000}k${v.index ? " · idx" : ""}</small>`;
+    b.title = v.blend ? `Blend: ${v.blend}` : "";
+    b.onclick = () => { voice = v.id; [...box.children].forEach((c) => c.classList.toggle("sel", c === b)); refresh(); };
+    box.appendChild(b);
+  }
+  box.firstChild.click();
+}
+document.querySelectorAll(".slider input").forEach((el) => {
+  const out = el.parentElement.querySelector("output");
+  const show = () => out.textContent = el.id === "pitch" ? `${el.value > 0 ? "+" : ""}${el.value} st` : Number(el.value).toFixed(2);
+  el.oninput = show; show();
+});
+function refresh() { $("go").disabled = !(inputWav && voice); }
+
+// ---------------------------------------------------------------- convert
+$("go").onclick = async () => {
+  const go = $("go"); go.disabled = true; go.innerHTML = '<span class="spin"></span>Converting';
+  $("err").textContent = "";
+  const form = new FormData();
+  form.append("audio", inputWav, "input.wav");
+  form.append("voice", voice);
+  for (const k of ["pitch", "index_rate", "protect", "rms_mix_rate"]) form.append(k, $(k).value);
+  try {
+    const res = await fetch("/api/convert", { method: "POST", body: form });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const url = URL.createObjectURL(await res.blob());
+    $("outAudio").src = url; $("dl").href = url;
+    const secs = +res.headers.get("X-Duration"), took = +res.headers.get("X-Elapsed");
+    $("stats").textContent = `${secs.toFixed(1)} s in ${took.toFixed(2)} s · ${(secs / took).toFixed(1)}× real-time`;
+    $("result").classList.add("show");
+    $("outAudio").play();
+  } catch (e) { $("err").textContent = e.message; }
+  go.textContent = "Convert"; refresh();
+};
+loadVoices();
+</script>
+</body>
+</html>
